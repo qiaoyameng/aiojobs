@@ -27,6 +27,8 @@ class Job(Generic[_T]):
         "_explicit",
         "_task",
         "_source_traceback",
+        "_sequence",
+        "_has_pending_slot",
     )
 
     def __init__(
@@ -34,6 +36,7 @@ class Job(Generic[_T]):
         coro: Coroutine[object, object, _T],
         scheduler: Scheduler,
         name: Optional[str] = None,
+        sequence: int = 0,
     ):
         self._coro = coro
         self._scheduler: Optional[Scheduler] = scheduler
@@ -44,6 +47,8 @@ class Job(Generic[_T]):
         self._closed = False
         self._explicit = False
         self._task: Optional[asyncio.Task[_T]] = None
+        self._sequence = sequence
+        self._has_pending_slot = False
 
         tb = traceback.extract_stack(sys._getframe(2)) if loop.get_debug() else None
         self._source_traceback = tb
@@ -121,11 +126,10 @@ class Job(Generic[_T]):
 
     async def _close(self, timeout: Optional[float]) -> None:
         self._closed = True
+        if self._scheduler is not None:
+            self._scheduler._discard_pending(self)
         if self._task is None:
-            # the task is closed immediately without actual execution
-            # it prevents a warning like
-            # RuntimeWarning: coroutine 'coro' was never awaited
-            self._start()
+            self._cancel_before_start()
             assert self._task is not None
         self._task.cancel()
         # self._scheduler is None after _done_callback()
@@ -176,7 +180,15 @@ class Job(Generic[_T]):
         assert self._task is None
         self._task = asyncio.create_task(self._coro, name=self._name)
         self._task.add_done_callback(self._done_callback)
-        self._started.set_result(None)
+        if not self._started.done():
+            self._started.set_result(None)
+
+    def _cancel_before_start(self) -> None:
+        assert self._task is None
+        self._closed = True
+        self._start()
+        assert self._task is not None
+        self._task.cancel()
 
     def _done_callback(self, task: "asyncio.Task[_T]") -> None:
         assert self._scheduler is not None

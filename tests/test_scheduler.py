@@ -16,6 +16,62 @@ else:
 _MakeScheduler = Callable[..., Awaitable[Scheduler]]
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.time = 0.0
+        self.timers: List[tuple[float, int, Callable[..., None]]] = []
+        self._sequence = 0
+
+    def patch(self, scheduler: Scheduler, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(type(scheduler), "_time", lambda scheduler: self.time)
+        monkeypatch.setattr(
+            type(scheduler),
+            "_call_at",
+            lambda scheduler, when, callback: self.call_at(when, callback),
+        )
+
+    def call_at(self, when: float, callback: Callable[..., None]) -> object:
+        sequence = self._sequence
+        self._sequence += 1
+        entry = (when, sequence, callback)
+        self.timers.append(entry)
+        self.timers.sort(key=lambda item: (item[0], item[1]))
+        timers = self.timers
+        scheduled_entry = entry
+
+        class FakeHandle:
+            def __init__(self) -> None:
+                self._cancelled = False
+                self._timers = timers
+                self._entry = scheduled_entry
+
+            def cancel(self) -> None:
+                if self._cancelled:
+                    return
+                self._cancelled = True
+                try:
+                    self._timers.remove(self._entry)
+                except ValueError:
+                    pass
+
+            def cancelled(self) -> bool:
+                return self._cancelled
+
+        return FakeHandle()
+
+    def call_later(
+        self, delay: float, callback: Callable[..., None], *args: object
+    ) -> object:
+        return self.call_at(self.time + delay, lambda: callback(*args))
+
+    async def advance(self, seconds: float) -> None:
+        self.time += seconds
+        while self.timers and self.timers[0][0] <= self.time:
+            _, _, callback = self.timers.pop(0)
+            callback()
+            await asyncio.sleep(0)
+
+
 def test_ctor(scheduler: Scheduler) -> None:
     assert len(scheduler) == 0
 
@@ -356,6 +412,202 @@ async def test_pending_queue_limit_wait(make_scheduler: _MakeScheduler) -> None:
 
     assert scheduler.active_count == 1
     assert scheduler.pending_count == 1
+
+
+async def test_spawn_at_counts_as_pending(
+    make_scheduler: _MakeScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduler = await make_scheduler()
+    clock = FakeClock()
+    clock.patch(scheduler, monkeypatch)
+
+    started: List[int] = []
+
+    async def coro(value: int) -> None:
+        started.append(value)
+
+    job = await scheduler.spawn_at(coro(1), 100.0)
+
+    assert len(scheduler) == 1
+    assert scheduler.active_count == 0
+    assert scheduler.pending_count == 1
+    assert job.pending
+    assert started == []
+    assert len(clock.timers) == 1
+
+    await clock.advance(100.0)
+    await asyncio.sleep(0)
+
+    assert scheduler.active_count == 0
+    assert scheduler.pending_count == 0
+    assert job.closed
+    assert started == [1]
+
+
+async def test_spawn_at_earlier_deadline_interrupts_later_wake(
+    make_scheduler: _MakeScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    clock = FakeClock()
+    clock.patch(scheduler, monkeypatch)
+
+    blocker = asyncio.Event()
+    started: List[str] = []
+
+    async def block() -> None:
+        await blocker.wait()
+
+    async def record(name: str) -> None:
+        started.append(name)
+
+    await scheduler.spawn(block())
+    later_job = await scheduler.spawn_at(record("later"), 100.0)
+    assert clock.timers[0][0] == 100.0
+
+    earlier_job = await scheduler.spawn_at(record("earlier"), 10.0)
+    assert clock.timers[0][0] == 10.0
+
+    await clock.advance(10.0)
+    assert started == []
+    assert scheduler.pending_count == 2
+
+    blocker.set()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert started == ["earlier"]
+    await clock.advance(90.0)
+    await later_job.wait()
+    await earlier_job.wait()
+
+    assert started == ["earlier", "later"]
+
+
+async def test_spawn_at_same_time_preserves_submission_order(
+    make_scheduler: _MakeScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    clock = FakeClock()
+    clock.patch(scheduler, monkeypatch)
+
+    blocker = asyncio.Event()
+    started: List[str] = []
+
+    async def block() -> None:
+        await blocker.wait()
+
+    async def record(name: str) -> None:
+        started.append(name)
+
+    await scheduler.spawn(block())
+    first_job = await scheduler.spawn_at(record("first"), 100.0)
+    second_job = await scheduler.spawn_at(record("second"), 100.0)
+
+    await clock.advance(100.0)
+    blocker.set()
+    await asyncio.sleep(0)
+    await first_job.wait()
+    await second_job.wait()
+
+    assert started == ["first", "second"]
+
+
+async def test_spawn_at_uses_pending_capacity(
+    make_scheduler: _MakeScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduler = await make_scheduler(limit=1, pending_limit=1)
+    clock = FakeClock()
+    clock.patch(scheduler, monkeypatch)
+
+    async def noop() -> None:
+        pass
+
+    await scheduler.spawn(asyncio.sleep(1))
+    await scheduler.spawn_at(noop(), 100.0)
+
+    assert scheduler.pending_count == 1
+    blocked_spawn = asyncio.create_task(scheduler.spawn_at(noop(), 200.0))
+    await asyncio.sleep(0)
+
+    assert not blocked_spawn.done()
+    assert scheduler.pending_count == 1
+    blocked_spawn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked_spawn
+    assert scheduler.pending_count == 1
+
+
+async def test_close_future_job_does_not_resurrect(
+    make_scheduler: _MakeScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduler = await make_scheduler()
+    clock = FakeClock()
+    clock.patch(scheduler, monkeypatch)
+
+    started = asyncio.Event()
+
+    async def coro() -> None:
+        started.set()
+
+    job = await scheduler.spawn_at(coro(), 100.0)
+    await job.close()
+
+    assert job.closed
+    assert not clock.timers
+    await clock.advance(100.0)
+    await asyncio.sleep(0)
+    assert not started.is_set()
+
+
+async def test_wait_future_job_timeout_does_not_resurrect(
+    make_scheduler: _MakeScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduler = await make_scheduler()
+    clock = FakeClock()
+    clock.patch(scheduler, monkeypatch)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(
+        loop,
+        "call_later",
+        lambda delay, callback, *args: clock.call_later(delay, callback, *args),
+    )
+    started = False
+
+    async def coro() -> None:
+        nonlocal started
+        started = True
+
+    job = await scheduler.spawn_at(coro(), 100.0)
+    wait_task = asyncio.create_task(job.wait(timeout=0.01))
+    await asyncio.sleep(0)
+    await clock.advance(0.01)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await wait_task
+
+    assert job.closed
+    await clock.advance(100.0)
+    await asyncio.sleep(0)
+    assert not started
+
+
+async def test_wait_and_close_cancels_future_job_without_future_wake(
+    make_scheduler: _MakeScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scheduler = await make_scheduler()
+    clock = FakeClock()
+    clock.patch(scheduler, monkeypatch)
+
+    started = asyncio.Event()
+
+    async def coro() -> None:
+        started.set()
+
+    await scheduler.spawn_at(coro(), 100.0)
+    await scheduler.wait_and_close()
+
+    assert scheduler.closed
+    assert not clock.timers
+    assert not started.is_set()
 
 
 async def test_scheduler_concurrency_pending_limit(

@@ -87,7 +87,8 @@ Scheduler
 
    .. attribute:: pending_count: int
 
-      Count of scheduled but not executed yet jobs.
+      Count of scheduled but not executed yet jobs, including jobs waiting
+      for their scheduled start time.
 
    .. attribute:: closed: bool
 
@@ -112,6 +113,21 @@ Scheduler
       .. versionchanged:: 0.2
 
          The method respects :attr:`pending_limit` now.
+
+   .. py:method:: spawn_at[T](coro: Coroutine[Any, Any, T], start_time: float, name: str | None = None) -> Job
+      :async:
+
+      Spawn a new job that may start no earlier than *start_time*.
+
+      *start_time* is measured with the event loop's monotonic clock, as
+      returned by :meth:`asyncio.BaseEventLoop.time`.
+
+      A job that has not reached its start time is counted by
+      :attr:`pending_count`, not :attr:`active_count`. When its start time
+      is reached, it starts immediately if a concurrency slot is available;
+      otherwise it waits in the pending queue.
+
+      Jobs with the same start time start in submission order.
 
    .. py:method:: shield[T](coro: Future[T] | Awaitable[T]) -> Future
       :async:
@@ -177,7 +193,8 @@ Job
 
    Job has three states:
 
-     * *pending*: spawn but not executed yet because of concurrency limit
+     * *pending*: spawn but not executed yet because the concurrency limit
+       was reached or its scheduled start time has not been reached
      * *active*: is executing now
      * *closed*: job has finished or stopped.
 
