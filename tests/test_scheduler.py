@@ -358,6 +358,202 @@ async def test_pending_queue_limit_wait(make_scheduler: _MakeScheduler) -> None:
     assert scheduler.pending_count == 1
 
 
+async def test_pause_queues_new_jobs_until_last_handle_released(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    started: List[asyncio.Event] = []
+
+    async def coro(index: int) -> None:
+        started[index].set()
+
+    first = scheduler.pause()
+    second = scheduler.pause()
+    started.extend(asyncio.Event() for _ in range(2))
+
+    job1 = await scheduler.spawn(coro(0))
+    job2 = await scheduler.spawn(coro(1))
+    assert job1.pending
+    assert job2.pending
+    assert scheduler.pending_count == 2
+
+    first.release()
+    await asyncio.sleep(0)
+    assert job1.pending
+    assert job2.pending
+
+    second.release()
+    await job1.wait()
+    await job2.wait()
+    assert started[0].is_set()
+    assert started[1].is_set()
+
+
+async def test_interleaved_pause_handles_control_queue_progress(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    first_running = asyncio.Event()
+    allow_first = asyncio.Event()
+    allow_second = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def first_job() -> None:
+        first_running.set()
+        await allow_first.wait()
+
+    async def second_job() -> None:
+        second_started.set()
+        await allow_second.wait()
+
+    job1 = await scheduler.spawn(first_job())
+    await first_running.wait()
+
+    first_pause = scheduler.pause()
+    job2 = await scheduler.spawn(second_job())
+    second_pause = scheduler.pause()
+
+    draining = asyncio.ensure_future(first_pause.drain())
+    await asyncio.sleep(0)
+    assert not draining.done()
+    assert job2.pending
+
+    allow_first.set()
+    await draining
+    assert job2.pending
+
+    first_pause.release()
+    await asyncio.sleep(0)
+    assert job2.pending
+
+    second_pause.release()
+    await second_started.wait()
+    assert job2.active
+
+    allow_second.set()
+    await job1.wait()
+    await job2.wait()
+
+
+async def test_pause_respects_pending_limit(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler(limit=1, pending_limit=1)
+    pause = scheduler.pause()
+
+    async def coro() -> None:
+        pass
+
+    await scheduler.spawn(coro())
+    blocked_spawn = asyncio.ensure_future(scheduler.spawn(coro()))
+    await asyncio.sleep(0)
+    assert not blocked_spawn.done()
+    assert scheduler.pending_count == 1
+
+    pause.release()
+    await blocked_spawn
+
+
+async def test_drain_without_active_jobs_completes_immediately(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler()
+    pause = scheduler.pause()
+
+    async with asyncio_timeout(0.01):
+        await pause.drain()
+
+    pause.release()
+
+
+async def test_paused_pending_jobs_do_not_extend_empty_barrier(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+
+    async def coro() -> None:
+        await asyncio.sleep(0)
+
+    async with scheduler.pause() as pause:
+        assert scheduler.paused
+        await scheduler.spawn(coro())
+        await scheduler.spawn(coro())
+        assert scheduler.pending_count == 2
+
+        async with asyncio_timeout(0.01):
+            await pause.wait_drained()
+
+    assert not scheduler.paused
+    await scheduler.wait_and_close()
+
+
+async def test_drain_job_completing_before_wait_starts(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler()
+
+    async def coro() -> None:
+        pass
+
+    job = await scheduler.spawn(coro())
+    pause = scheduler.pause()
+    await job.wait()
+    await pause.drain()
+    pause.release()
+
+
+async def test_cancelling_drain_does_not_cancel_running_job(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler()
+    allow_job = asyncio.Event()
+    job_started = asyncio.Event()
+
+    async def coro() -> None:
+        job_started.set()
+        await allow_job.wait()
+
+    job = await scheduler.spawn(coro())
+    await job_started.wait()
+    pause = scheduler.pause()
+
+    draining = asyncio.ensure_future(pause.drain())
+    await asyncio.sleep(0)
+    draining.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await draining
+
+    assert job.active
+    allow_job.set()
+    await job.wait()
+
+
+async def test_closing_scheduler_terminates_draining(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(close_timeout=1)
+    allow_job = asyncio.Event()
+    job_started = asyncio.Event()
+
+    async def coro() -> None:
+        job_started.set()
+        await allow_job.wait()
+
+    await scheduler.spawn(coro())
+    await job_started.wait()
+    pause = scheduler.pause()
+
+    draining = asyncio.ensure_future(pause.drain())
+    closing = asyncio.ensure_future(scheduler.close())
+    await asyncio.wait({draining, closing}, return_when=asyncio.FIRST_COMPLETED)
+
+    assert draining.done()
+    assert isinstance(draining.exception(), RuntimeError)
+    await closing
+
+    pause.release()
+    with pytest.raises(RuntimeError):
+        scheduler.pause()
+
+
 async def test_scheduler_concurrency_pending_limit(
     make_scheduler: _MakeScheduler,
 ) -> None:

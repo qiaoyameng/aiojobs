@@ -42,6 +42,10 @@ class Scheduler(Collection[Job[object]]):
         "_failed_task",
         "_pending",
         "_closed",
+        "_paused",
+        "_active",
+        "_drain_waiters",
+        "_drain_tasks",
     )
 
     def __init__(
@@ -70,8 +74,14 @@ class Scheduler(Collection[Job[object]]):
         self._failed_task: Optional[asyncio.Task[None]] = None
         if sys.version_info < (3, 10):
             self._failed_task = asyncio.create_task(self._wait_failed())
-        self._pending: asyncio.Queue[Job[object]] = asyncio.Queue(maxsize=pending_limit)
+        self._pending: asyncio.Queue[Job[object]] = asyncio.Queue(
+            maxsize=pending_limit
+        )
         self._closed = False
+        self._paused = 0
+        self._active: Set[Job[object]] = set()
+        self._drain_waiters: Set[asyncio.Future[None]] = set()
+        self._drain_tasks: Set[asyncio.Task[None]] = set()
 
     def __iter__(self) -> Iterator[Job[Any]]:
         return iter(self._jobs)
@@ -116,7 +126,7 @@ class Scheduler(Collection[Job[object]]):
 
     @property
     def active_count(self) -> int:
-        return len(self._jobs) - self._pending.qsize()
+        return len(self._active)
 
     @property
     def pending_count(self) -> int:
@@ -125,6 +135,22 @@ class Scheduler(Collection[Job[object]]):
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def paused(self) -> bool:
+        return self._paused > 0
+
+    def pause(self) -> "PauseHandle":
+        if self._closed:
+            raise RuntimeError("Cannot pause a closed scheduler")
+        self._paused += 1
+        return PauseHandle(self, frozenset(self._active))
+
+    async def drain(self) -> None:
+        await self._drain(frozenset(self._active))
+
+    async def wait_drained(self) -> None:
+        await self.drain()
 
     async def spawn(
         self, coro: Coroutine[object, object, _T], name: Optional[str] = None
@@ -137,9 +163,12 @@ class Scheduler(Collection[Job[object]]):
             if self._failed_task.get_loop() is not asyncio.get_running_loop():
                 raise RuntimeError(f"{self!r} is bound to a different event loop")
         job = Job(coro, self, name=name)
-        should_start = self._limit is None or self.active_count < self._limit
+        should_start = not self.paused and (
+            self._limit is None or self.active_count < self._limit
+        )
         if should_start:
             job._start()
+            self._active.add(job)
         else:
             try:
                 # wait for free slot in queue
@@ -204,6 +233,12 @@ class Scheduler(Collection[Job[object]]):
         if self._closed:
             return
         self._closed = True  # prevent adding new jobs
+        closed_error = RuntimeError("Scheduler is closed")
+        for waiter in self._drain_waiters:
+            if not waiter.done():
+                waiter.set_exception(closed_error)
+        if self._drain_waiters:
+            await asyncio.gather(*tuple(self._drain_waiters), return_exceptions=True)
 
         jobs = self._jobs
         if jobs or self._shields:
@@ -220,6 +255,8 @@ class Scheduler(Collection[Job[object]]):
                 *(asyncio.wait_for(f, self._close_timeout) for f in self._shields),
                 return_exceptions=True,
             )
+            if self._drain_tasks:
+                await asyncio.gather(*self._drain_tasks, return_exceptions=True)
             self._jobs.clear()
         if self._failed_task is not None:
             self._failed_tasks.put_nowait(None)
@@ -237,20 +274,50 @@ class Scheduler(Collection[Job[object]]):
 
     def _done(self, job: Job[object]) -> None:
         self._jobs.discard(job)
-        if not self.pending_count:
+        self._active.discard(job)
+        self._start_pending()
+
+    def _start_pending(self) -> None:
+        if self.paused:
             return
-        # No pending jobs when limit is None
-        # Safe to subtract.
-        ntodo = self._limit - self.active_count  # type: ignore[operator]
-        i = 0
-        while i < ntodo:
-            if not self.pending_count:
+        while self._pending.qsize():
+            if self._limit is not None and len(self._active) >= self._limit:
                 return
             new_job = self._pending.get_nowait()
             if new_job.closed:
                 continue
             new_job._start()
-            i += 1
+            self._active.add(new_job)
+
+    async def _wait_jobs(self, jobs: Collection[Job[object]]) -> None:
+        await asyncio.gather(
+            *(job._task for job in jobs if job._task is not None),
+            return_exceptions=True,
+        )
+
+    async def _drain(self, jobs: Collection[Job[object]]) -> None:
+        if self._closed:
+            raise RuntimeError("Scheduler is closed")
+        if not jobs:
+            return
+
+        loop = asyncio.get_running_loop()
+        drain_task = asyncio.create_task(self._wait_jobs(jobs))
+        self._drain_tasks.add(drain_task)
+        drain_task.add_done_callback(self._drain_tasks.discard)
+
+        closed_waiter = loop.create_future()
+        self._drain_waiters.add(closed_waiter)
+        try:
+            await asyncio.wait(
+                {drain_task, closed_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            self._drain_waiters.discard(closed_waiter)
+
+        if closed_waiter.done():
+            closed_waiter.result()
 
     async def _wait_failed(self) -> None:
         # a coroutine for waiting failed tasks
@@ -267,3 +334,61 @@ class Scheduler(Collection[Job[object]]):
                 # by Job._add_done_callback
                 # Thus we caught an task exception and we are good citizens
                 pass
+
+
+class PauseHandle:
+    __slots__ = ("_scheduler", "_jobs", "_released")
+
+    def __init__(
+        self,
+        scheduler: Scheduler,
+        jobs: Collection[Job[object]],
+    ) -> None:
+        self._scheduler = scheduler
+        self._jobs = frozenset(jobs)
+        self._released = False
+
+    async def __aenter__(self) -> "PauseHandle":
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        self.release()
+
+    def __enter__(self) -> "PauseHandle":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        self.release()
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    async def drain(self) -> None:
+        await self._scheduler._drain(self._jobs)
+
+    async def wait_drained(self) -> None:
+        await self.drain()
+
+    def release(self) -> None:
+        if self._released:
+            raise RuntimeError("Pause handle has already been released")
+        self._released = True
+        if self._scheduler.closed:
+            return
+        self._scheduler._paused -= 1
+        if not self._scheduler.paused:
+            self._scheduler._start_pending()
+
+    def resume(self) -> None:
+        self.release()

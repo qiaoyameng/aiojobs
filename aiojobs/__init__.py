@@ -9,7 +9,7 @@ import warnings
 from typing import Optional
 
 from ._job import Job
-from ._scheduler import ExceptionHandler, Scheduler
+from ._scheduler import ExceptionHandler, PauseHandle, Scheduler
 
 __version__ = "1.4.0"
 
@@ -35,4 +35,4 @@ async def create_scheduler(
     )
 
 
-__all__ = ("Job", "Scheduler", "create_scheduler")
+__all__ = ("Job", "PauseHandle", "Scheduler", "create_scheduler")

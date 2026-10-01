@@ -113,6 +113,29 @@ Scheduler
 
          The method respects :attr:`pending_limit` now.
 
+      While a :meth:`pause` handle is held, jobs are still added to the
+      pending queue according to :attr:`pending_limit`, but jobs are not
+      started until every pause handle has been released.
+
+   .. py:method:: pause() -> PauseHandle
+
+      Pause starting new jobs and return a nestable pause handle.
+
+      Multiple calls acquire multiple handles; scheduling resumes only
+      after the final handle is released. The handle can be released
+      explicitly with :meth:`PauseHandle.release` or by using it as a
+      synchronous or asynchronous context manager.
+
+      Raises :exc:`RuntimeError` if the scheduler is already closed.
+
+   .. py:method:: drain() -> None
+      :async:
+
+      Wait for jobs that are currently running.
+
+      Unlike :meth:`wait_and_close`, jobs submitted while the scheduler
+      is paused remain pending and do not extend this barrier.
+
    .. py:method:: shield[T](coro: Future[T] | Awaitable[T]) -> Future
       :async:
 
@@ -166,6 +189,41 @@ Scheduler
       * *source_traceback*: a traceback at the moment of job creation
         (present only for debug event loops, see also
         :envvar:`PYTHONASYNCIODEBUG`).
+
+
+PauseHandle
+-----------
+
+.. class:: PauseHandle
+
+   A handle returned by :meth:`Scheduler.pause`.
+
+   The handle can be used as a context manager::
+
+      with scheduler.pause() as pause:
+          await pause.drain()
+
+   .. py:method:: drain() -> None
+      :async:
+
+      Wait for the jobs that were already running when this handle was
+      acquired. Jobs submitted or queued later do not extend the wait.
+
+      Cancelling the coroutine waiting for this method does not cancel
+      the underlying jobs. Closing the scheduler terminates the wait
+      with :exc:`RuntimeError`.
+
+   .. method:: release() -> None
+
+      Release this pause handle.
+
+      Scheduling resumes when the last outstanding handle is released.
+      Releasing a handle after the scheduler is closed does not resume
+      pending jobs.
+
+   .. attribute:: released: bool
+
+      ``True`` if this handle has been released.
 
 
 Job
