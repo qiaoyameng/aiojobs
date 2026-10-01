@@ -93,6 +93,39 @@ Scheduler
 
       ``True`` if scheduler is closed (:meth:`close` called).
 
+   .. attribute:: paused: bool
+
+      ``True`` if at least one :meth:`pause` guard is held.
+
+   .. py:method:: pause() -> AsyncContextManager
+
+      Return an async context manager that suspends starting of new
+      jobs while held::
+
+         async with scheduler.pause():
+             ...
+
+      Guards can be nested and held by multiple owners at once;
+      scheduling resumes only when the last held guard is released.
+
+      While paused, :meth:`spawn` still accepts new jobs (respecting
+      :attr:`pending_limit`) but keeps them in the pending queue
+      instead of starting them.
+
+      Pausing a closed scheduler raises :exc:`RuntimeError`; releasing
+      a guard after the scheduler was closed never resumes scheduling.
+
+   .. py:method:: drain() -> None
+      :async:
+
+      Wait for jobs that are running at the moment of the call to
+      finish.  Jobs spawned later (e.g. pending jobs submitted while
+      the scheduler is paused) don't extend the wait, and the method
+      returns immediately if nothing is running.
+
+      Cancelling the caller doesn't cancel the running jobs.
+      Closing the scheduler terminates the wait.
+
    .. py:method:: spawn[T](coro: Coroutine[Any, Any, T], name: str | None = None) -> Job
       :async:
 
@@ -101,7 +134,8 @@ Scheduler
       Return a new :class:`Job` object.
 
       The job might be started immediately or pushed into pending list
-      if concurrency :attr:`limit` exceeded.
+      if concurrency :attr:`limit` exceeded or the scheduler is
+      :attr:`paused`.
 
       If :attr:`pending_count` is greater than :attr:`pending_limit`
       and the limit is *finite* (not ``0``) the method suspends

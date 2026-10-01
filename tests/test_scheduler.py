@@ -667,3 +667,196 @@ def test_scheduler_must_be_created_within_running_loop() -> None:
         Scheduler(close_timeout=0, limit=0, pending_limit=0, exception_handler=None)
 
     assert exc_info.match("no (current|running) event loop")
+
+
+async def test_pause_keeps_spawned_jobs_pending(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(pending_limit=10)
+    started = False
+
+    async def coro() -> None:
+        nonlocal started
+        started = True
+
+    async with scheduler.pause():
+        assert scheduler.paused
+        job = await scheduler.spawn(coro())
+        await asyncio.sleep(0.01)
+        assert job.pending
+        assert not started
+        assert scheduler.pending_count == 1
+    assert not scheduler.paused
+    await asyncio.sleep(0.01)
+    assert job.closed
+    assert started
+
+
+async def test_pause_nested_interleaved(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler(limit=1, pending_limit=10)
+    gate = asyncio.Event()
+    started: List[str] = []
+
+    async def coro(tag: str) -> None:
+        started.append(tag)
+        await gate.wait()
+
+    job1 = await scheduler.spawn(coro("first"))
+    await asyncio.sleep(0)
+    assert started == ["first"]
+
+    guard_a = scheduler.pause()
+    async with guard_a:
+        job2 = await scheduler.spawn(coro("second"))
+        await asyncio.sleep(0.01)
+        assert job2.pending
+
+        async with scheduler.pause():
+            job3 = await scheduler.spawn(coro("third"))
+            await asyncio.sleep(0.01)
+            assert job3.pending
+            # A free slot doesn't resume scheduling while any guard is held.
+            gate.set()
+            await asyncio.sleep(0.01)
+            assert job1.closed
+            assert job2.pending
+            assert job3.pending
+
+        # Inner guard released, the outer one is still held: queue stands still.
+        assert scheduler.paused
+        await asyncio.sleep(0.01)
+        assert job2.pending
+        assert job3.pending
+
+    # The last guard is released: scheduling resumes.
+    assert not scheduler.paused
+    await asyncio.sleep(0.01)
+    assert started == ["first", "second", "third"]
+    assert job2.closed
+    assert job3.closed
+
+
+async def test_drain_waits_for_running_jobs_only(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(pending_limit=10)
+    gate = asyncio.Event()
+    finished: List[str] = []
+
+    async def coro(tag: str) -> None:
+        await gate.wait()
+        finished.append(tag)
+
+    job1 = await scheduler.spawn(coro("running"))
+    await asyncio.sleep(0)
+
+    async with scheduler.pause():
+        job2 = await scheduler.spawn(coro("late"))
+        assert job2.pending
+
+        drain_task = asyncio.create_task(scheduler.drain())
+        await asyncio.sleep(0.01)
+        assert not drain_task.done()
+
+        gate.set()
+        await asyncio.wait_for(drain_task, timeout=1)
+        # The drain barrier covers only jobs running when it was entered.
+        assert finished == ["running"]
+        assert job2.pending
+
+    await asyncio.sleep(0.01)
+    assert finished == ["running", "late"]
+
+
+async def test_drain_no_jobs(scheduler: Scheduler) -> None:
+    # The barrier completes immediately, without waiting for a job callback.
+    await asyncio.wait_for(scheduler.drain(), timeout=1)
+
+
+async def test_drain_only_pending_jobs(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler(pending_limit=10)
+
+    async def coro() -> None:
+        await asyncio.sleep(1)
+
+    async with scheduler.pause():
+        job = await scheduler.spawn(coro())
+        assert job.pending
+        # Nothing is running, the barrier completes immediately.
+        await asyncio.wait_for(scheduler.drain(), timeout=1)
+
+
+async def test_drain_cancel_does_not_cancel_jobs(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler()
+    gate = asyncio.Event()
+    done = False
+
+    async def coro() -> None:
+        nonlocal done
+        await gate.wait()
+        done = True
+
+    job = await scheduler.spawn(coro())
+    await asyncio.sleep(0)
+
+    drain_task = asyncio.create_task(scheduler.drain())
+    await asyncio.sleep(0)
+    drain_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await drain_task
+
+    assert job.active
+    gate.set()
+    await asyncio.sleep(0.01)
+    assert done
+    assert job.closed
+
+
+async def test_close_terminates_drain(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def coro() -> None:
+        started.set()
+        await release.wait()
+
+    await scheduler.spawn(coro())
+    await started.wait()
+
+    drain_task = asyncio.create_task(scheduler.drain())
+    await asyncio.sleep(0)
+    assert not drain_task.done()
+
+    await scheduler.close()
+    await asyncio.wait_for(drain_task, timeout=1)
+
+
+async def test_pause_closed_scheduler(scheduler: Scheduler) -> None:
+    await scheduler.close()
+    with pytest.raises(RuntimeError, match="Cannot pause a closed scheduler"):
+        async with scheduler.pause():
+            pass  # pragma: no cover
+
+
+async def test_pause_release_after_close_does_not_resume(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(pending_limit=10)
+    started = False
+
+    async def coro() -> None:
+        nonlocal started
+        started = True
+
+    async with scheduler.pause():
+        job = await scheduler.spawn(coro())
+        assert job.pending
+        await scheduler.close()
+    # Releasing the last guard on a closed scheduler must not raise
+    # nor restart anything.
+    assert scheduler.closed
+    assert job.closed
+    assert not started

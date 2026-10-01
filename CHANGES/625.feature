@@ -1,0 +1,1 @@
+Added ``Scheduler.pause()`` (a nestable async context manager that suspends starting of new jobs while still accepting them into the pending queue) and ``Scheduler.drain()`` (a barrier that waits only for the jobs running at the moment of the call).

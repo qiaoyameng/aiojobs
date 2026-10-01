@@ -42,6 +42,7 @@ class Scheduler(Collection[Job[object]]):
         "_failed_task",
         "_pending",
         "_closed",
+        "_pause_count",
     )
 
     def __init__(
@@ -72,6 +73,7 @@ class Scheduler(Collection[Job[object]]):
             self._failed_task = asyncio.create_task(self._wait_failed())
         self._pending: asyncio.Queue[Job[object]] = asyncio.Queue(maxsize=pending_limit)
         self._closed = False
+        self._pause_count = 0
 
     def __iter__(self) -> Iterator[Job[Any]]:
         return iter(self._jobs)
@@ -86,6 +88,8 @@ class Scheduler(Collection[Job[object]]):
         info = []
         if self._closed:
             info.append("closed")
+        if self._pause_count:
+            info.append("paused")
         state = " ".join(info)
         if state:
             state += " "
@@ -126,6 +130,50 @@ class Scheduler(Collection[Job[object]]):
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def paused(self) -> bool:
+        return self._pause_count > 0
+
+    def pause(self) -> "_PauseGuard":
+        """Return an async context manager suspending jobs scheduling.
+
+        While at least one guard is held, :meth:`spawn` still accepts new
+        jobs (respecting :attr:`pending_limit`) but keeps them pending
+        instead of starting them.  Guards can be nested; scheduling
+        resumes when the last held guard is released.
+        """
+        return _PauseGuard(self)
+
+    async def drain(self) -> None:
+        """Wait for jobs that are running right now to finish.
+
+        Jobs spawned after this call (e.g. pending ones while the
+        scheduler is paused) don't extend the wait.  Returns immediately
+        if nothing is running.  Cancelling the caller doesn't cancel
+        the running jobs.
+        """
+        jobs = [job for job in self._jobs if job.active]
+        if not jobs:
+            return
+        gather = asyncio.gather(
+            *(job._wait() for job in jobs),
+            return_exceptions=True,
+        )
+        await asyncio.shield(gather)
+
+    def _pause_acquire(self) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot pause a closed scheduler")
+        self._pause_count += 1
+
+    def _pause_release(self) -> None:
+        assert self._pause_count > 0
+        self._pause_count -= 1
+        if self._pause_count == 0 and not self._closed:
+            # The last guard is released, resume scheduling.
+            # A closed scheduler never resumes.
+            self._start_pending()
+
     async def spawn(
         self, coro: Coroutine[object, object, _T], name: Optional[str] = None
     ) -> Job[_T]:
@@ -137,7 +185,9 @@ class Scheduler(Collection[Job[object]]):
             if self._failed_task.get_loop() is not asyncio.get_running_loop():
                 raise RuntimeError(f"{self!r} is bound to a different event loop")
         job = Job(coro, self, name=name)
-        should_start = self._limit is None or self.active_count < self._limit
+        should_start = not self.paused and (
+            self._limit is None or self.active_count < self._limit
+        )
         if should_start:
             job._start()
         else:
@@ -237,20 +287,18 @@ class Scheduler(Collection[Job[object]]):
 
     def _done(self, job: Job[object]) -> None:
         self._jobs.discard(job)
-        if not self.pending_count:
+        self._start_pending()
+
+    def _start_pending(self) -> None:
+        if self.paused:
             return
-        # No pending jobs when limit is None
-        # Safe to subtract.
-        ntodo = self._limit - self.active_count  # type: ignore[operator]
-        i = 0
-        while i < ntodo:
-            if not self.pending_count:
+        while self.pending_count:
+            if self._limit is not None and self.active_count >= self._limit:
                 return
             new_job = self._pending.get_nowait()
             if new_job.closed:
                 continue
             new_job._start()
-            i += 1
 
     async def _wait_failed(self) -> None:
         # a coroutine for waiting failed tasks
@@ -267,3 +315,28 @@ class Scheduler(Collection[Job[object]]):
                 # by Job._add_done_callback
                 # Thus we caught an task exception and we are good citizens
                 pass
+
+
+class _PauseGuard:
+    """An async context manager returned by :meth:`Scheduler.pause`."""
+
+    __slots__ = ("_scheduler", "_held")
+
+    def __init__(self, scheduler: Scheduler) -> None:
+        self._scheduler = scheduler
+        self._held = False
+
+    async def __aenter__(self) -> "_PauseGuard":
+        self._scheduler._pause_acquire()
+        self._held = True
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        if self._held:
+            self._held = False
+            self._scheduler._pause_release()
