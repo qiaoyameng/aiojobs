@@ -1,4 +1,6 @@
 import asyncio
+import heapq
+import itertools
 import sys
 from collections.abc import Awaitable, Collection, Coroutine, Iterator
 from contextlib import suppress
@@ -7,8 +9,10 @@ from typing import (
     Any,
     Callable,
     Dict,
+    List,
     Optional,
     Set,
+    Tuple,
     Type,
     TypeVar,
     Union,
@@ -41,6 +45,11 @@ class Scheduler(Collection[Job[object]]):
         "_failed_tasks",
         "_failed_task",
         "_pending",
+        "_pending_slot",
+        "_delayed",
+        "_delayed_jobs",
+        "_delayed_handle",
+        "_delayed_seq",
         "_closed",
     )
 
@@ -71,6 +80,11 @@ class Scheduler(Collection[Job[object]]):
         if sys.version_info < (3, 10):
             self._failed_task = asyncio.create_task(self._wait_failed())
         self._pending: asyncio.Queue[Job[object]] = asyncio.Queue(maxsize=pending_limit)
+        self._pending_slot = asyncio.Event()
+        self._delayed: List[Tuple[float, int, Job[object]]] = []
+        self._delayed_jobs: Set[Job[object]] = set()
+        self._delayed_handle: Optional[asyncio.TimerHandle] = None
+        self._delayed_seq = itertools.count()
         self._closed = False
 
     def __iter__(self) -> Iterator[Job[Any]]:
@@ -116,11 +130,11 @@ class Scheduler(Collection[Job[object]]):
 
     @property
     def active_count(self) -> int:
-        return len(self._jobs) - self._pending.qsize()
+        return len(self._jobs) - self.pending_count
 
     @property
     def pending_count(self) -> int:
-        return self._pending.qsize()
+        return self._pending.qsize() + len(self._delayed_jobs)
 
     @property
     def closed(self) -> bool:
@@ -129,6 +143,48 @@ class Scheduler(Collection[Job[object]]):
     async def spawn(
         self, coro: Coroutine[object, object, _T], name: Optional[str] = None
     ) -> Job[_T]:
+        self._check_accepting_jobs()
+        job = Job(coro, self, name=name)
+        await self._admit(job)
+        self._jobs.add(job)
+        return job
+
+    async def spawn_at(
+        self,
+        when: float,
+        coro: Coroutine[object, object, _T],
+        name: Optional[str] = None,
+    ) -> Job[_T]:
+        """Spawn a new job that starts not earlier than *when*.
+
+        *when* is an absolute timestamp on the running event loop's
+        monotonic clock (the same scale as ``loop.time()``).
+
+        The job does not occupy ``active_count`` until the deadline is
+        reached, but it is accounted in ``pending_count`` and respects
+        ``pending_limit``.  Once due, the job still respects the
+        concurrency ``limit``.  Jobs with equal deadlines are started
+        in submission order.
+        """
+        self._check_accepting_jobs()
+        job = Job(coro, self, name=name)
+        if when <= self._monotonic():
+            # the deadline has already passed, admit the job as usual
+            await self._admit(job)
+        else:
+            try:
+                # wait for free slot in pending capacity
+                await self._acquire_pending_capacity()
+            except (asyncio.CancelledError, RuntimeError):
+                await job.close()
+                raise
+            self._delayed_jobs.add(job)
+            heapq.heappush(self._delayed, (when, next(self._delayed_seq), job))
+            self._schedule_delayed_wakeup()
+        self._jobs.add(job)
+        return job
+
+    def _check_accepting_jobs(self) -> None:
         if self._closed:
             raise RuntimeError("Scheduling a new job after closing")
         if self._failed_task is None:
@@ -136,19 +192,78 @@ class Scheduler(Collection[Job[object]]):
         else:
             if self._failed_task.get_loop() is not asyncio.get_running_loop():
                 raise RuntimeError(f"{self!r} is bound to a different event loop")
-        job = Job(coro, self, name=name)
+
+    async def _admit(self, job: Job[object]) -> None:
         should_start = self._limit is None or self.active_count < self._limit
         if should_start:
             job._start()
         else:
             try:
                 # wait for free slot in queue
-                await self._pending.put(job)
-            except asyncio.CancelledError:
+                await self._acquire_pending_capacity()
+                self._pending.put_nowait(job)
+            except (asyncio.CancelledError, RuntimeError):
                 await job.close()
                 raise
-        self._jobs.add(job)
-        return job
+
+    async def _acquire_pending_capacity(self) -> None:
+        maxsize = self._pending.maxsize
+        if maxsize <= 0:
+            return  # infinite pending capacity
+        while self.pending_count >= maxsize:
+            if self._closed:
+                raise RuntimeError("Scheduling a new job after closing")
+            self._pending_slot.clear()
+            if self.pending_count < maxsize or self._closed:
+                continue
+            await self._pending_slot.wait()
+
+    def _monotonic(self) -> float:
+        return asyncio.get_running_loop().time()
+
+    def _call_at(self, when: float, callback: Callable[[], None]) -> asyncio.TimerHandle:
+        return asyncio.get_running_loop().call_at(when, callback)
+
+    def _schedule_delayed_wakeup(self) -> None:
+        # drop stale heap entries left by jobs closed before their deadline
+        while self._delayed and self._delayed[0][2] not in self._delayed_jobs:
+            heapq.heappop(self._delayed)
+        if not self._delayed:
+            if self._delayed_handle is not None:
+                self._delayed_handle.cancel()
+                self._delayed_handle = None
+            return
+        when = self._delayed[0][0]
+        handle = self._delayed_handle
+        if handle is not None:
+            if handle.when() == when:
+                return
+            # a closer deadline was inserted, move the wakeup earlier
+            handle.cancel()
+        self._delayed_handle = self._call_at(when, self._start_due_delayed)
+
+    def _start_due_delayed(self) -> None:
+        self._delayed_handle = None
+        now = self._monotonic()
+        while self._delayed and self._delayed[0][0] <= now:
+            _, _, job = heapq.heappop(self._delayed)
+            if job not in self._delayed_jobs:
+                continue  # stale entry, the job was closed before its deadline
+            if job.closed:
+                self._delayed_jobs.discard(job)
+                continue
+            # check the limit before discarding the job from the delayed set
+            # so the job doesn't count itself as active
+            should_start = self._limit is None or self.active_count < self._limit
+            self._delayed_jobs.discard(job)
+            if should_start:
+                job._start()
+            else:
+                # the concurrency limit is still in effect for due jobs;
+                # pending capacity was reserved on submission
+                self._pending.put_nowait(job)
+        self._schedule_delayed_wakeup()
+        self._pending_slot.set()
 
     def shield(self, arg: _FutureLike[_T]) -> "asyncio.Future[_T]":
         inner = asyncio.ensure_future(arg)
@@ -205,6 +320,15 @@ class Scheduler(Collection[Job[object]]):
             return
         self._closed = True  # prevent adding new jobs
 
+        # stop the delayed-job machinery; delayed jobs themselves are in
+        # self._jobs and are closed below without waiting for their deadline
+        if self._delayed_handle is not None:
+            self._delayed_handle.cancel()
+            self._delayed_handle = None
+        self._delayed.clear()
+        self._delayed_jobs.clear()
+        self._pending_slot.set()  # wake up spawners waiting for pending capacity
+
         jobs = self._jobs
         if jobs or self._shields:
             # cleanup pending queue
@@ -237,16 +361,21 @@ class Scheduler(Collection[Job[object]]):
 
     def _done(self, job: Job[object]) -> None:
         self._jobs.discard(job)
-        if not self.pending_count:
+        if job in self._delayed_jobs:
+            # a delayed job was closed before its deadline
+            self._delayed_jobs.discard(job)
+            self._pending_slot.set()
+        if self._pending.empty():
             return
-        # No pending jobs when limit is None
+        # No pending jobs in the queue when limit is None
         # Safe to subtract.
         ntodo = self._limit - self.active_count  # type: ignore[operator]
         i = 0
         while i < ntodo:
-            if not self.pending_count:
+            if self._pending.empty():
                 return
             new_job = self._pending.get_nowait()
+            self._pending_slot.set()
             if new_job.closed:
                 continue
             new_job._start()

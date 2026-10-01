@@ -89,6 +89,11 @@ Scheduler
 
       Count of scheduled but not executed yet jobs.
 
+      .. versionchanged:: 1.5
+
+         Jobs submitted with :meth:`spawn_at` are counted here while
+         waiting for their start time.
+
    .. attribute:: closed: bool
 
       ``True`` if scheduler is closed (:meth:`close` called).
@@ -112,6 +117,30 @@ Scheduler
       .. versionchanged:: 0.2
 
          The method respects :attr:`pending_limit` now.
+
+   .. py:method:: spawn_at[T](when: float, coro: Coroutine[Any, Any, T], name: str | None = None) -> Job
+      :async:
+
+      Spawn a new job for execution *coro* coroutine not earlier than
+      *when*.
+
+      *when* is an absolute timestamp on the event loop's monotonic
+      clock (the same scale as :meth:`asyncio.AbstractEventLoop.time`).
+
+      Return a new :class:`Job` object.
+
+      The job does not occupy :attr:`active_count` until the deadline
+      is reached, but it is accounted in :attr:`pending_count` and
+      respects :attr:`pending_limit`: if the pending capacity is
+      *finite* (not ``0``) and exhausted the method suspends execution
+      until a free slot appears.
+
+      Once the deadline is reached the job still respects the
+      concurrency :attr:`limit`: it is started immediately or pushed
+      into the pending queue.  Jobs with equal deadlines are processed
+      in submission order.
+
+      .. versionadded:: 1.5
 
    .. py:method:: shield[T](coro: Future[T] | Awaitable[T]) -> Future
       :async:
