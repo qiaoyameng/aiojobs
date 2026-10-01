@@ -51,6 +51,11 @@ and closed.
 Scheduler is a container for spawned jobs with implied concurrency
 limit.
 
+A job group ties together jobs that should complete together. A failure
+in one group cancels its other members without affecting independent
+groups, while all groups continue to share the scheduler's concurrency
+and pending limits.
+
 Scheduler's jobs could be enumerated and closed.
 
 There is simple usage example::

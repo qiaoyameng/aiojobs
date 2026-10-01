@@ -27,6 +27,7 @@ class Job(Generic[_T]):
         "_explicit",
         "_task",
         "_source_traceback",
+        "_group",
     )
 
     def __init__(
@@ -34,6 +35,7 @@ class Job(Generic[_T]):
         coro: Coroutine[object, object, _T],
         scheduler: Scheduler,
         name: Optional[str] = None,
+        group: object = None,
     ):
         self._coro = coro
         self._scheduler: Optional[Scheduler] = scheduler
@@ -47,6 +49,9 @@ class Job(Generic[_T]):
 
         tb = traceback.extract_stack(sys._getframe(2)) if loop.get_debug() else None
         self._source_traceback = tb
+        self._group = group
+        if group is not None:
+            self._explicit = True
 
     def __repr__(self) -> str:
         info = []
@@ -181,17 +186,29 @@ class Job(Generic[_T]):
     def _done_callback(self, task: "asyncio.Task[_T]") -> None:
         assert self._scheduler is not None
         scheduler = self._scheduler
+        if self._group is not None:
+            self._group._job_done(self)
         scheduler._done(self)
         try:
             exc = task.exception()
         except asyncio.CancelledError:
             pass
         else:
-            if exc is not None and not self._explicit:
+            if exc is not None and not self._explicit and self._group is None:
                 self._report_exception(exc)
                 scheduler._failed_tasks.put_nowait(task)
         self._scheduler = None  # drop backref
         self._closed = True
+
+    def _discard_pending(self) -> None:
+        assert self._scheduler is not None
+        scheduler = self._scheduler
+        scheduler._jobs.discard(self)
+        if self._group is not None:
+            self._group._job_discarded(self)
+        self._scheduler = None
+        self._closed = True
+        self._coro.close()
 
     def _report_exception(self, exc: BaseException) -> None:
         assert self._scheduler is not None

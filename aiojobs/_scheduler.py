@@ -15,6 +15,7 @@ from typing import (
 )
 
 from ._job import Job
+from ._group import JobGroup
 
 if sys.version_info >= (3, 11):
     from asyncio import timeout as asyncio_timeout
@@ -41,6 +42,7 @@ class Scheduler(Collection[Job[object]]):
         "_failed_tasks",
         "_failed_task",
         "_pending",
+        "_groups",
         "_closed",
     )
 
@@ -71,6 +73,7 @@ class Scheduler(Collection[Job[object]]):
         if sys.version_info < (3, 10):
             self._failed_task = asyncio.create_task(self._wait_failed())
         self._pending: asyncio.Queue[Job[object]] = asyncio.Queue(maxsize=pending_limit)
+        self._groups: Set[JobGroup[object]] = set()
         self._closed = False
 
     def __iter__(self) -> Iterator[Job[Any]]:
@@ -137,18 +140,47 @@ class Scheduler(Collection[Job[object]]):
             if self._failed_task.get_loop() is not asyncio.get_running_loop():
                 raise RuntimeError(f"{self!r} is bound to a different event loop")
         job = Job(coro, self, name=name)
+        await self._spawn_job(job)
+        return job
+
+    def create_group(self) -> JobGroup[object]:
+        if self._closed:
+            raise RuntimeError("Creating a job group after closing")
+        return JobGroup(self)
+
+    group = create_group
+
+    def _discard_pending(self, job: Job[object]) -> None:
+        queue = self._pending._queue
+        try:
+            queue.remove(job)
+        except ValueError:
+            return
+        self._pending._wakeup_next(self._pending._getters)
+
+    async def _spawn_job(self, job: Job[object]) -> None:
         should_start = self._limit is None or self.active_count < self._limit
         if should_start:
+            self._jobs.add(job)
             job._start()
-        else:
-            try:
-                # wait for free slot in queue
-                await self._pending.put(job)
-            except asyncio.CancelledError:
+            return
+
+        try:
+            # wait for free slot in queue
+            await self._pending.put(job)
+        except asyncio.CancelledError:
+            if job._task is None and not job.closed:
+                self._discard_pending(job)
+                job._discard_pending()
+            elif job.closed:
+                self._jobs.discard(job)
+            else:
                 await job.close()
-                raise
+            raise
+
+        if job.closed:
+            return
         self._jobs.add(job)
-        return job
 
     def shield(self, arg: _FutureLike[_T]) -> "asyncio.Future[_T]":
         inner = asyncio.ensure_future(arg)
@@ -205,18 +237,38 @@ class Scheduler(Collection[Job[object]]):
             return
         self._closed = True  # prevent adding new jobs
 
+        groups = set(self._groups)
+        for group in groups:
+            group._begin_close()
+
         jobs = self._jobs
-        if jobs or self._shields:
-            # cleanup pending queue
-            # all job will be started on closing
+        if jobs or self._shields or groups:
+            group_jobs = {
+                job
+                for group in groups
+                for job in group._members
+                if job in jobs
+            }
+            pending_group_jobs = {
+                job for job in group_jobs if job.pending
+            }
             while not self._pending.empty():
-                self._pending.get_nowait()
+                job = self._pending.get_nowait()
+                if job not in pending_group_jobs:
+                    job._start()
+
+            ungrouped_jobs = jobs - group_jobs
 
             for f in self._shields:
                 f.cancel()
 
             await asyncio.gather(
-                *(job._close(self._close_timeout) for job in jobs),
+                *(
+                    job._close(self._close_timeout)
+                    for job in ungrouped_jobs
+                    if not job.closed
+                ),
+                *(group.close() for group in groups),
                 *(asyncio.wait_for(f, self._close_timeout) for f in self._shields),
                 return_exceptions=True,
             )

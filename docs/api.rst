@@ -113,6 +113,11 @@ Scheduler
 
          The method respects :attr:`pending_limit` now.
 
+   .. py:method:: create_group() -> JobGroup
+
+      Create a new :class:`JobGroup` in this scheduler. :meth:`group` is
+      provided as an alias.
+
    .. py:method:: shield[T](coro: Future[T] | Awaitable[T]) -> Future
       :async:
 
@@ -166,6 +171,60 @@ Scheduler
       * *source_traceback*: a traceback at the moment of job creation
         (present only for debug event loops, see also
         :envvar:`PYTHONASYNCIODEBUG`).
+
+
+JobGroup
+--------
+
+.. class:: JobGroup
+
+   A group of jobs submitted through the same :class:`Scheduler`.
+
+   Groups inherit the scheduler's concurrency and pending limits. Waiting
+   for a successful group waits for every member to finish. If a member
+   raises a regular exception, the group is closed, running members are
+   cancelled, and jobs that have not started are discarded. Other groups
+   using the same scheduler keep running.
+
+   Create a group with :meth:`Scheduler.create_group` (also available as
+   :meth:`Scheduler.group`)::
+
+      group = scheduler.create_group()
+      await group.spawn(job1())
+      await group.spawn(job2())
+      results = await group.wait()
+
+   .. py:method:: spawn[T](coro: Coroutine[Any, Any, T], name: str | None = None) -> Job
+      :async:
+
+      Submit a job to the scheduler and track it in the group.
+
+   .. py:method:: wait() -> list[Any]
+      :async:
+
+      Wait for all members. On success, return their results in submission
+      order. After waiting, the group does not accept new jobs.
+
+      If one or more jobs fail, raise :class:`JobGroupError` after cancelling
+      and cleaning up the rest of the group. The exception's ``errors``
+      property contains a ``(job, exception)`` pair for every failed job.
+
+   .. py:method:: close() -> None
+      :async:
+
+      Reject new jobs, discard pending members, cancel running members, and
+      wait for cancellation cleanup. Exceptions raised during cleanup are
+      included in the resulting :class:`JobGroupError`.
+
+.. class:: JobGroupError(Exception)
+
+   Raised by a failed group.
+
+   .. attribute:: errors
+
+      A tuple of ``(job, exception)`` pairs in the order the failures were
+      recorded. The first item is the original failure; later items are
+      failures observed while cancelling and cleaning up other members.
 
 
 Job
