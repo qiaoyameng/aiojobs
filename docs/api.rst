@@ -16,7 +16,9 @@ Scheduler
                      wait_timeout: float | None = 60.0, \
                      limit: int = 100, \
                      pending_limit: int = 10000, \
-                     exception_handler: ExceptionHandler | None = None)
+                     exception_handler: ExceptionHandler | None = None, \
+                     aging_interval: float | None = None, \
+                     aging_step: int = 1)
 
    A container for managed jobs.
 
@@ -41,6 +43,13 @@ Scheduler
 
    * *pending_limit* is a limit for amount of jobs awaiting starting,
      ``10000`` by default. Use ``0`` for infinite pending queue size.
+
+   * *aging_interval* and *aging_step* configure optional priority
+     aging. When *aging_interval* is ``None`` (the default), aging is
+     disabled and all jobs with equal priority start in submission
+     order. When set, the effective priority of a pending job is
+     increased by *aging_step* after every complete *aging_interval*
+     seconds spent in the pending queue.
 
    * *exception_handler* is a callable with
      ``handler(scheduler, context)`` signature to log
@@ -89,11 +98,23 @@ Scheduler
 
       Count of scheduled but not executed yet jobs.
 
+   .. attribute:: aging_interval: float | None
+
+      Waiting time represented by one aging step, or ``None`` when
+      aging is disabled.
+
+   .. attribute:: aging_step: int
+
+      Priority added to a pending job after every complete
+      :attr:`aging_interval`.
+
    .. attribute:: closed: bool
 
       ``True`` if scheduler is closed (:meth:`close` called).
 
-   .. py:method:: spawn[T](coro: Coroutine[Any, Any, T], name: str | None = None) -> Job
+   .. py:method:: spawn[T](coro: Coroutine[Any, Any, T],
+                          name: str | None = None, *,
+                          priority: int = 0) -> Job
       :async:
 
       Spawn a new job for execution *coro* coroutine.
@@ -106,8 +127,13 @@ Scheduler
       If :attr:`pending_count` is greater than :attr:`pending_limit`
       and the limit is *finite* (not ``0``) the method suspends
       execution without scheduling a new job (adding it into pending
-      queue) until penging queue size will be reduced to have a free
-      slot.
+      queue) until pending queue size is reduced to have a free slot.
+
+      A larger *priority* makes a pending job eligible to start
+      earlier. Priority never cancels or preempts a running job. Jobs
+      with the same effective priority start in their original
+      submission order. The default priority is ``0`` and, with aging
+      disabled, preserves FIFO scheduling.
 
       .. versionchanged:: 0.2
 
@@ -215,6 +241,20 @@ Job
       If *timeout* exceeded :exc:`asyncio.TimeoutError` raised.
 
       The job is in *closed* state after finishing the method.
+
+   .. method:: get_priority() -> int
+
+      Return the job's configured priority. For a pending job, this
+      does not include its current aging bonus.
+
+   .. method:: set_priority(priority: int) -> None
+
+      Change the priority of a pending job without closing and
+      resubmitting it. The original submission order is retained as
+      the tie-breaker for equal effective priorities.
+
+      Raises :class:`RuntimeError` if the job has already started or
+      closed; running jobs are not preempted.
 
 Integration with aiohttp web server
 -----------------------------------

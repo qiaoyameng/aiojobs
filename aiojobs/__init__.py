@@ -20,6 +20,8 @@ async def create_scheduler(
     limit: Optional[int] = 100,
     pending_limit: int = 10000,
     exception_handler: Optional[ExceptionHandler] = None,
+    aging_interval: Optional[float] = None,
+    aging_step: int = 1,
 ) -> Scheduler:
     warnings.warn("Scheduler can now be instantiated directly.", DeprecationWarning)
 
@@ -32,6 +34,8 @@ async def create_scheduler(
         limit=limit,
         pending_limit=pending_limit,
         exception_handler=exception_handler,
+        aging_interval=aging_interval,
+        aging_step=aging_step,
     )
 
 

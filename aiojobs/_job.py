@@ -22,6 +22,9 @@ class Job(Generic[_T]):
         "_coro",
         "_scheduler",
         "_name",
+        "_priority",
+        "_sequence",
+        "_queued_at",
         "_started",
         "_closed",
         "_explicit",
@@ -34,10 +37,18 @@ class Job(Generic[_T]):
         coro: Coroutine[object, object, _T],
         scheduler: Scheduler,
         name: Optional[str] = None,
+        *,
+        priority: int = 0,
+        sequence: int = 0,
     ):
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise TypeError("priority must be an integer")
         self._coro = coro
         self._scheduler: Optional[Scheduler] = scheduler
         self._name = name
+        self._priority = priority
+        self._sequence = sequence
+        self._queued_at: Optional[float] = None
         loop = asyncio.get_running_loop()
         self._started = loop.create_future()
 
@@ -84,6 +95,32 @@ class Job(Generic[_T]):
         if self._task is not None:
             self._task.set_name(name)
 
+    def get_priority(self) -> int:
+        return self._priority
+
+    def set_priority(self, priority: int) -> None:
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise TypeError("priority must be an integer")
+        if not self.pending:
+            raise RuntimeError("Only pending job priority can be changed")
+        assert self._scheduler is not None
+        self._priority = priority
+        self._scheduler._priority_changed(self)
+
+    def _effective_priority(self, now: float) -> int:
+        priority = self._priority
+        scheduler = self._scheduler
+        if (
+            scheduler is not None
+            and scheduler._aging_interval is not None
+            and self._queued_at is not None
+        ):
+            age = now - self._queued_at
+            if age >= 0:
+                steps = int(age // scheduler._aging_interval)
+                priority += steps * scheduler._aging_step
+        return priority
+
     async def _do_wait(self, timeout: Optional[float]) -> _T:
         async with asyncio_timeout(timeout):
             # TODO: add a test for waiting for a pending coro
@@ -122,6 +159,8 @@ class Job(Generic[_T]):
     async def _close(self, timeout: Optional[float]) -> None:
         self._closed = True
         if self._task is None:
+            assert self._scheduler is not None
+            self._scheduler._discard_pending(self)
             # the task is closed immediately without actual execution
             # it prevents a warning like
             # RuntimeWarning: coroutine 'coro' was never awaited

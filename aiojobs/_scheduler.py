@@ -1,4 +1,6 @@
 import asyncio
+import heapq
+import math
 import sys
 from collections.abc import Awaitable, Collection, Coroutine, Iterator
 from contextlib import suppress
@@ -9,6 +11,7 @@ from typing import (
     Dict,
     Optional,
     Set,
+    Tuple,
     Type,
     TypeVar,
     Union,
@@ -27,6 +30,59 @@ else:
 _T = TypeVar("_T")
 _FutureLike = Union["asyncio.Future[_T]", Awaitable[_T]]
 ExceptionHandler = Callable[["Scheduler", Dict[str, Any]], None]
+_PendingJobEntry = Tuple[int, int, "Job[object]"]
+
+
+class _PriorityQueue(asyncio.PriorityQueue[Job[object]]):
+    def __init__(self, maxsize: int, aging_enabled: bool) -> None:
+        self._aging_enabled = aging_enabled
+        super().__init__(maxsize=maxsize)
+
+    def _entry(self, job: Job[object], now: float) -> _PendingJobEntry:
+        return (-job._effective_priority(now), job._sequence, job)
+
+    def _put(self, item: Job[object]) -> None:
+        now = asyncio.get_running_loop().time()
+        item._queued_at = now
+        heapq.heappush(self._queue, self._entry(item, now))
+
+    def _get(self) -> Job[object]:
+        if self._aging_enabled and self._queue:
+            now = asyncio.get_running_loop().time()
+            self._queue = [
+                self._entry(job, now) for _, _, job in self._queue
+            ]
+            heapq.heapify(self._queue)
+        _, _, job = heapq.heappop(self._queue)
+        job._queued_at = None
+        return job
+
+    def priority_changed(self, job: Job[object]) -> None:
+        for index, (_, _, queued_job) in enumerate(self._queue):
+            if queued_job is job:
+                now = asyncio.get_running_loop().time()
+                self._queue[index] = self._entry(job, now)
+                heapq.heapify(self._queue)
+                return
+
+    def discard(self, job: Job[object]) -> bool:
+        for index, (_, _, queued_job) in enumerate(self._queue):
+            if queued_job is job:
+                removed = self._queue.pop(index)
+                heapq.heapify(self._queue)
+                self._wakeup_next(self._putters)
+                removed[2]._queued_at = None
+                return True
+        return False
+
+    def clear(self) -> None:
+        for _, _, job in self._queue:
+            job._queued_at = None
+        self._queue.clear()
+        while self._putters:
+            putter = self._putters.popleft()
+            if not putter.done():
+                putter.cancel()
 
 
 class Scheduler(Collection[Job[object]]):
@@ -41,6 +97,9 @@ class Scheduler(Collection[Job[object]]):
         "_failed_tasks",
         "_failed_task",
         "_pending",
+        "_next_sequence",
+        "_aging_interval",
+        "_aging_step",
         "_closed",
     )
 
@@ -52,6 +111,8 @@ class Scheduler(Collection[Job[object]]):
         limit: Optional[int] = 100,
         pending_limit: int = 10000,
         exception_handler: Optional[ExceptionHandler] = None,
+        aging_interval: Optional[float] = None,
+        aging_step: int = 1,
     ):
         if exception_handler is not None and not callable(exception_handler):
             raise TypeError(
@@ -70,7 +131,25 @@ class Scheduler(Collection[Job[object]]):
         self._failed_task: Optional[asyncio.Task[None]] = None
         if sys.version_info < (3, 10):
             self._failed_task = asyncio.create_task(self._wait_failed())
-        self._pending: asyncio.Queue[Job[object]] = asyncio.Queue(maxsize=pending_limit)
+        self._next_sequence = 0
+        if aging_interval is not None and (
+            isinstance(aging_interval, bool)
+            or not isinstance(aging_interval, (int, float))
+        ):
+            raise TypeError("aging_interval must be a number or None")
+        if aging_interval is not None:
+            if not math.isfinite(aging_interval) or aging_interval <= 0:
+                raise ValueError("aging_interval must be a positive number")
+        if isinstance(aging_step, bool) or not isinstance(aging_step, int):
+            raise TypeError("aging_step must be an integer")
+        if aging_step <= 0:
+            raise ValueError("aging_step must be a positive integer")
+        self._aging_interval = aging_interval
+        self._aging_step = aging_step
+        self._pending: _PriorityQueue = _PriorityQueue(
+            maxsize=pending_limit,
+            aging_enabled=aging_interval is not None,
+        )
         self._closed = False
 
     def __iter__(self) -> Iterator[Job[Any]]:
@@ -123,20 +202,41 @@ class Scheduler(Collection[Job[object]]):
         return self._pending.qsize()
 
     @property
+    def aging_interval(self) -> Optional[float]:
+        return self._aging_interval
+
+    @property
+    def aging_step(self) -> int:
+        return self._aging_step
+
+    @property
     def closed(self) -> bool:
         return self._closed
 
     async def spawn(
-        self, coro: Coroutine[object, object, _T], name: Optional[str] = None
+        self,
+        coro: Coroutine[object, object, _T],
+        name: Optional[str] = None,
+        *,
+        priority: int = 0,
     ) -> Job[_T]:
         if self._closed:
             raise RuntimeError("Scheduling a new job after closing")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise TypeError("priority must be an integer")
         if self._failed_task is None:
             self._failed_task = asyncio.create_task(self._wait_failed())
         else:
             if self._failed_task.get_loop() is not asyncio.get_running_loop():
                 raise RuntimeError(f"{self!r} is bound to a different event loop")
-        job = Job(coro, self, name=name)
+        job = Job(
+            coro,
+            self,
+            name=name,
+            priority=priority,
+            sequence=self._next_sequence,
+        )
+        self._next_sequence += 1
         should_start = self._limit is None or self.active_count < self._limit
         if should_start:
             job._start()
@@ -149,6 +249,13 @@ class Scheduler(Collection[Job[object]]):
                 raise
         self._jobs.add(job)
         return job
+
+    def _priority_changed(self, job: Job[object]) -> None:
+        self._pending.priority_changed(job)
+
+    def _discard_pending(self, job: Job[object]) -> None:
+        if self._pending.discard(job):
+            self._jobs.discard(job)
 
     def shield(self, arg: _FutureLike[_T]) -> "asyncio.Future[_T]":
         inner = asyncio.ensure_future(arg)
@@ -207,10 +314,7 @@ class Scheduler(Collection[Job[object]]):
 
         jobs = self._jobs
         if jobs or self._shields:
-            # cleanup pending queue
-            # all job will be started on closing
-            while not self._pending.empty():
-                self._pending.get_nowait()
+            self._pending.clear()
 
             for f in self._shields:
                 f.cancel()
@@ -236,6 +340,9 @@ class Scheduler(Collection[Job[object]]):
         return self._exception_handler
 
     def _done(self, job: Job[object]) -> None:
+        if self._closed:
+            self._jobs.discard(job)
+            return
         self._jobs.discard(job)
         if not self.pending_count:
             return

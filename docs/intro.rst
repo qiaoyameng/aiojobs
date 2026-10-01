@@ -91,6 +91,50 @@ The limit could be relaxed by passing *limit* parameter into
 :class:`Scheduler`: ``aiojobs.Scheduler(limit=100000)`` or even
 disabled by ``limit=None``.
 
+Priorities and aging
+~~~~~~~~~~~~~~~~~~~~
+
+Pending jobs can be assigned an integer priority when they are
+spawned::
+
+    diagnostics = await scheduler.spawn(run_diagnostics(), priority=10)
+    refresh = await scheduler.spawn(refresh_cache(), priority=0)
+
+Larger numbers start earlier. Priority only selects jobs that have not
+started yet; a running coroutine is never cancelled or preempted. Jobs
+with the same effective priority start in their original submission
+order, so the default configuration (priority ``0`` and no aging) keeps
+the previous FIFO behavior.
+
+The priority of a queued job can be changed directly with
+:meth:`Job.set_priority`; closing and resubmitting the job is not
+necessary and would give it a new submission position. Changing the
+configured priority does not reset the job's accumulated waiting time.
+
+Aging prevents a low-priority job from waiting forever while higher
+priority jobs keep arriving. Configure it with *aging_interval* and
+*aging_step*::
+
+    scheduler = aiojobs.Scheduler(
+        limit=100,
+        aging_interval=5.0,
+        aging_step=1,
+    )
+
+Waiting time starts when a job has actually been accepted into the
+pending queue, not when a blocked :meth:`Scheduler.spawn` call began
+waiting for ``pending_limit`` capacity. While queued, the job's
+effective priority is its configured priority plus
+``floor(waiting_time / aging_interval) * aging_step``. Aging is
+recomputed when a running job releases a concurrency slot and the next
+pending job is selected.
+
+The finite :attr:`Scheduler.pending_limit` counts queued jobs only;
+callers blocked by that limit do not occupy a queue slot. Closing a
+pending job removes it immediately and releases its queue slot. On
+scheduler shutdown, pending jobs are removed from the queue and
+cancelled without starting merely to consume an active slot.
+
 Graceful Shutdown
 -----------------
 

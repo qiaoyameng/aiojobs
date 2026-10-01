@@ -358,6 +358,226 @@ async def test_pending_queue_limit_wait(make_scheduler: _MakeScheduler) -> None:
     assert scheduler.pending_count == 1
 
 
+async def test_pending_jobs_start_by_priority(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler(limit=1)
+    started: List[str] = []
+    release = asyncio.Event()
+
+    async def worker(name: str) -> None:
+        started.append(name)
+        await release.wait()
+
+    blocker = await scheduler.spawn(worker("blocker"), priority=0)
+    normal = await scheduler.spawn(worker("normal"), priority=0)
+    high = await scheduler.spawn(worker("high"), priority=10)
+
+    assert [job.get_priority() for job in (blocker, normal, high)] == [0, 0, 10]
+    release.set()
+    await asyncio.gather(blocker.wait(), normal.wait(), high.wait())
+
+    assert started == ["blocker", "high", "normal"]
+
+
+async def test_equal_priority_keeps_submission_order(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    started: List[str] = []
+    release = asyncio.Event()
+
+    async def worker(name: str) -> None:
+        started.append(name)
+        await release.wait()
+
+    blocker = await scheduler.spawn(worker("blocker"))
+    first = await scheduler.spawn(worker("first"))
+    second = await scheduler.spawn(worker("second"))
+
+    release.set()
+    await asyncio.gather(blocker.wait(), first.wait(), second.wait())
+
+    assert started == ["blocker", "first", "second"]
+
+
+async def test_set_priority_reorders_pending_job(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    started: List[str] = []
+    release = asyncio.Event()
+
+    async def worker(name: str) -> None:
+        started.append(name)
+        await release.wait()
+
+    blocker = await scheduler.spawn(worker("blocker"))
+    normal = await scheduler.spawn(worker("normal"))
+    promoted = await scheduler.spawn(worker("promoted"))
+
+    promoted.set_priority(10)
+    assert promoted.get_priority() == 10
+
+    release.set()
+    await asyncio.gather(blocker.wait(), normal.wait(), promoted.wait())
+
+    assert started == ["blocker", "promoted", "normal"]
+
+
+async def test_set_priority_only_for_pending_job(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    job = await scheduler.spawn(asyncio.sleep(0), priority=1)
+
+    with pytest.raises(RuntimeError, match="pending"):
+        job.set_priority(2)
+
+    await job.wait()
+    with pytest.raises(RuntimeError, match="pending"):
+        job.set_priority(2)
+
+
+async def test_priority_must_be_integer(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler(limit=1)
+    blocker = await scheduler.spawn(asyncio.sleep(0))
+
+    invalid_priority_coro = asyncio.sleep(0)
+    with pytest.raises(TypeError):
+        await scheduler.spawn(invalid_priority_coro, priority=True)
+    await invalid_priority_coro
+
+    pending = await scheduler.spawn(asyncio.sleep(0), priority=0)
+    with pytest.raises(TypeError):
+        pending.set_priority(1.5)
+
+    await blocker.wait()
+    await pending.wait()
+
+
+async def test_aging_configuration(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler(aging_interval=0.5, aging_step=3)
+    assert scheduler.aging_interval == 0.5
+    assert scheduler.aging_step == 3
+
+    with pytest.raises(TypeError):
+        await make_scheduler(aging_interval=True)
+    with pytest.raises(ValueError):
+        await make_scheduler(aging_interval=0)
+    with pytest.raises(TypeError):
+        await make_scheduler(aging_step=1.0)
+    with pytest.raises(ValueError):
+        await make_scheduler(aging_step=0)
+
+
+async def test_set_priority_does_not_reset_aging(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1, aging_interval=10, aging_step=2)
+
+    async def worker() -> None:
+        pass
+
+    release = asyncio.Event()
+
+    async def blocker_worker() -> None:
+        await release.wait()
+
+    blocker = await scheduler.spawn(blocker_worker())
+    job = await scheduler.spawn(worker(), priority=0)
+    assert job.pending
+    queued_at = job._queued_at
+
+    future_time = queued_at + 25
+    assert job._effective_priority(future_time) == 4
+    job.set_priority(5)
+    assert job._effective_priority(future_time) == 9
+
+    assert job._queued_at == queued_at
+    await job.close()
+    release.set()
+    await blocker.wait()
+
+
+async def test_aging_allows_old_low_priority_job_to_run(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(
+        close_timeout=0.01,
+        limit=1,
+        pending_limit=0,
+        aging_interval=0.01,
+        aging_step=10,
+    )
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    max_active_count = 0
+    injected_high_priority_jobs = 0
+
+    def observe_active_count() -> None:
+        nonlocal max_active_count
+        max_active_count = max(max_active_count, scheduler.active_count)
+        assert scheduler.active_count <= scheduler.limit
+
+    async def blocker() -> None:
+        observe_active_count()
+        await asyncio.sleep(0.015)
+
+    async def old_low_priority() -> None:
+        observe_active_count()
+        started.set()
+        await finish.wait()
+
+    async def high_priority() -> None:
+        nonlocal injected_high_priority_jobs
+        observe_active_count()
+        injected_high_priority_jobs += 1
+
+    await scheduler.spawn(blocker(), priority=10)
+    old_job = await scheduler.spawn(old_low_priority(), priority=0)
+
+    while not started.is_set():
+        await scheduler.spawn(high_priority(), priority=9)
+        assert scheduler.active_count == 1
+        await asyncio.sleep(0.001)
+        assert scheduler.active_count == 1
+
+    assert old_job.active
+    assert injected_high_priority_jobs >= 1
+    finish.set()
+    await scheduler.wait_and_close()
+
+    assert max_active_count == 1
+
+
+async def test_cancelling_pending_job_releases_pending_limit(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1, pending_limit=1)
+    blocker_release = asyncio.Event()
+
+    async def worker() -> None:
+        await blocker_release.wait()
+
+    blocker = await scheduler.spawn(worker())
+    cancelled = await scheduler.spawn(worker())
+
+    async def fill_released_slot() -> Job[None]:
+        return await scheduler.spawn(worker())
+
+    replacement_task = asyncio.create_task(fill_released_slot())
+    await asyncio.sleep(0)
+    assert not replacement_task.done()
+
+    await cancelled.close()
+    replacement = await asyncio.wait_for(replacement_task, timeout=0.01)
+
+    assert scheduler.pending_count == 1
+    assert replacement.pending
+
+    blocker_release.set()
+    await scheduler.wait_and_close()
+
+
 async def test_scheduler_concurrency_pending_limit(
     make_scheduler: _MakeScheduler,
 ) -> None:
