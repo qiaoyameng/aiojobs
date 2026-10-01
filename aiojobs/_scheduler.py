@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import sys
 from collections.abc import Awaitable, Collection, Coroutine, Iterator
 from contextlib import suppress
@@ -7,6 +8,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    List,
     Optional,
     Set,
     Type,
@@ -27,6 +29,99 @@ else:
 _T = TypeVar("_T")
 _FutureLike = Union["asyncio.Future[_T]", Awaitable[_T]]
 ExceptionHandler = Callable[["Scheduler", Dict[str, Any]], None]
+
+
+class _PendingEntry:
+    """A single not-yet-started job waiting for a free slot."""
+
+    __slots__ = ("job", "seq", "enqueued_at")
+
+    def __init__(self, job: "Job[object]", seq: int, enqueued_at: float) -> None:
+        self.job = job
+        self.seq = seq
+        # Monotonic timestamp of the moment the job entered the pending
+        # queue; the aging bonus is computed from this point on.
+        self.enqueued_at = enqueued_at
+
+
+class _PendingQueue:
+    """A bounded queue of pending jobs ordered by effective priority.
+
+    The effective priority of a job is its base priority plus an aging
+    bonus: for every *aging_interval* seconds spent in the queue the job
+    gains one extra priority point (aging is disabled when
+    *aging_interval* is ``None``).  Jobs with equal effective priority
+    are dequeued in submission order, so the default configuration
+    (all priorities equal, no aging) is a plain FIFO.
+    """
+
+    __slots__ = ("_maxsize", "_aging_interval", "_entries", "_seq", "_not_full")
+
+    def __init__(self, maxsize: int, aging_interval: Optional[float]) -> None:
+        self._maxsize = maxsize
+        self._aging_interval = aging_interval
+        self._entries: List[_PendingEntry] = []
+        self._seq = itertools.count()
+        # Set while the queue has room for more entries.
+        self._not_full = asyncio.Event()
+        self._not_full.set()
+
+    @property
+    def maxsize(self) -> int:
+        return self._maxsize
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def _effective_priority(self, entry: _PendingEntry, now: float) -> float:
+        priority = entry.job.priority
+        if self._aging_interval is None:
+            return float(priority)
+        waited = now - entry.enqueued_at
+        return priority + waited / self._aging_interval
+
+    async def put(self, job: "Job[object]") -> None:
+        # maxsize <= 0 means an infinite queue, mirroring asyncio.Queue.
+        while 0 < self._maxsize <= len(self._entries):
+            self._not_full.clear()
+            await self._not_full.wait()
+        enqueued_at = asyncio.get_running_loop().time()
+        self._entries.append(_PendingEntry(job, next(self._seq), enqueued_at))
+
+    def pop_next(self) -> Optional["Job[object]"]:
+        """Pop the pending job with the highest effective priority.
+
+        Entries of jobs cancelled while waiting are discarded lazily
+        here (they keep occupying a pending slot until this point).
+        Returns ``None`` when no live pending job remains.
+        """
+        now = asyncio.get_running_loop().time()
+        best_idx = -1
+        best_key = (0.0, 0)
+        idx = 0
+        while idx < len(self._entries):
+            entry = self._entries[idx]
+            if entry.job.closed:
+                del self._entries[idx]
+                continue
+            # Negative seq: for equal effective priority the earliest
+            # submitted job wins.
+            key = (self._effective_priority(entry, now), -entry.seq)
+            if best_idx < 0 or key > best_key:
+                best_key = key
+                best_idx = idx
+            idx += 1
+        if best_idx < 0:
+            self._not_full.set()
+            return None
+        entry = self._entries.pop(best_idx)
+        if not 0 < self._maxsize <= len(self._entries):
+            self._not_full.set()
+        return entry.job
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._not_full.set()
 
 
 class Scheduler(Collection[Job[object]]):
@@ -51,11 +146,17 @@ class Scheduler(Collection[Job[object]]):
         wait_timeout: Optional[float] = 60,
         limit: Optional[int] = 100,
         pending_limit: int = 10000,
+        aging_interval: Optional[float] = None,
         exception_handler: Optional[ExceptionHandler] = None,
     ):
         if exception_handler is not None and not callable(exception_handler):
             raise TypeError(
                 f"A callable object or None is expected, got {exception_handler!r}"
+            )
+        if aging_interval is not None and aging_interval <= 0:
+            raise ValueError(
+                f"aging_interval must be a positive number or None, "
+                f"got {aging_interval!r}"
             )
 
         self._jobs: Set[Job[object]] = set()
@@ -70,7 +171,7 @@ class Scheduler(Collection[Job[object]]):
         self._failed_task: Optional[asyncio.Task[None]] = None
         if sys.version_info < (3, 10):
             self._failed_task = asyncio.create_task(self._wait_failed())
-        self._pending: asyncio.Queue[Job[object]] = asyncio.Queue(maxsize=pending_limit)
+        self._pending = _PendingQueue(pending_limit, aging_interval)
         self._closed = False
 
     def __iter__(self) -> Iterator[Job[Any]]:
@@ -116,18 +217,22 @@ class Scheduler(Collection[Job[object]]):
 
     @property
     def active_count(self) -> int:
-        return len(self._jobs) - self._pending.qsize()
+        return len(self._jobs) - len(self._pending)
 
     @property
     def pending_count(self) -> int:
-        return self._pending.qsize()
+        return len(self._pending)
 
     @property
     def closed(self) -> bool:
         return self._closed
 
     async def spawn(
-        self, coro: Coroutine[object, object, _T], name: Optional[str] = None
+        self,
+        coro: Coroutine[object, object, _T],
+        name: Optional[str] = None,
+        *,
+        priority: int = 0,
     ) -> Job[_T]:
         if self._closed:
             raise RuntimeError("Scheduling a new job after closing")
@@ -136,7 +241,7 @@ class Scheduler(Collection[Job[object]]):
         else:
             if self._failed_task.get_loop() is not asyncio.get_running_loop():
                 raise RuntimeError(f"{self!r} is bound to a different event loop")
-        job = Job(coro, self, name=name)
+        job = Job(coro, self, name=name, priority=priority)
         should_start = self._limit is None or self.active_count < self._limit
         if should_start:
             job._start()
@@ -209,8 +314,7 @@ class Scheduler(Collection[Job[object]]):
         if jobs or self._shields:
             # cleanup pending queue
             # all job will be started on closing
-            while not self._pending.empty():
-                self._pending.get_nowait()
+            self._pending.clear()
 
             for f in self._shields:
                 f.cancel()
@@ -244,11 +348,9 @@ class Scheduler(Collection[Job[object]]):
         ntodo = self._limit - self.active_count  # type: ignore[operator]
         i = 0
         while i < ntodo:
-            if not self.pending_count:
+            new_job = self._pending.pop_next()
+            if new_job is None:
                 return
-            new_job = self._pending.get_nowait()
-            if new_job.closed:
-                continue
             new_job._start()
             i += 1
 

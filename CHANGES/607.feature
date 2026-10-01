@@ -1,0 +1,1 @@
+Added optional priority scheduling for pending jobs: ``Scheduler.spawn()`` accepts a ``priority`` keyword, ``Job.set_priority()`` reprioritizes a queued job in-place, and the new ``aging_interval`` scheduler setting boosts long-waiting jobs so they cannot starve. The default configuration keeps the previous FIFO behavior.

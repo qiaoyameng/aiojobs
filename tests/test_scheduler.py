@@ -667,3 +667,179 @@ def test_scheduler_must_be_created_within_running_loop() -> None:
         Scheduler(close_timeout=0, limit=0, pending_limit=0, exception_handler=None)
 
     assert exc_info.match("no (current|running) event loop")
+
+
+async def test_priority_order(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler(limit=1)
+    started: List[str] = []
+    blocker = asyncio.Event()
+
+    async def blocking() -> None:
+        await blocker.wait()
+
+    async def coro(tag: str) -> None:
+        started.append(tag)
+
+    first = await scheduler.spawn(blocking())
+    low = await scheduler.spawn(coro("low"), priority=1)
+    high = await scheduler.spawn(coro("high"), priority=3)
+    mid = await scheduler.spawn(coro("mid"), priority=2)
+
+    assert first.active
+    assert scheduler.pending_count == 3
+    assert low.priority == 1
+    assert high.priority == 3
+    assert mid.priority == 2
+
+    blocker.set()
+    await scheduler.wait_and_close()
+
+    # Higher priority pending jobs are started first.
+    assert started == ["high", "mid", "low"]
+
+
+async def test_priority_fifo_for_equal_priority(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+    started: List[str] = []
+    blocker = asyncio.Event()
+
+    async def blocking() -> None:
+        await blocker.wait()
+
+    async def coro(tag: str) -> None:
+        started.append(tag)
+
+    await scheduler.spawn(blocking())
+    for tag in ("a", "b", "c"):
+        await scheduler.spawn(coro(tag), priority=5)
+
+    blocker.set()
+    await scheduler.wait_and_close()
+
+    # Equal effective priority falls back to submission order.
+    assert started == ["a", "b", "c"]
+
+
+async def test_default_spawn_is_fifo(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler(limit=1)
+    started: List[str] = []
+    blocker = asyncio.Event()
+
+    async def blocking() -> None:
+        await blocker.wait()
+
+    async def coro(tag: str) -> None:
+        started.append(tag)
+
+    await scheduler.spawn(blocking())
+    for tag in ("a", "b", "c"):
+        await scheduler.spawn(coro(tag))
+
+    blocker.set()
+    await scheduler.wait_and_close()
+
+    # Default configuration keeps the historical FIFO behavior.
+    assert started == ["a", "b", "c"]
+
+
+async def test_set_priority_pending_job(make_scheduler: _MakeScheduler) -> None:
+    scheduler = await make_scheduler(limit=1)
+    started: List[str] = []
+    blocker = asyncio.Event()
+
+    async def blocking() -> None:
+        await blocker.wait()
+
+    async def coro(tag: str) -> None:
+        started.append(tag)
+
+    await scheduler.spawn(blocking())
+    low = await scheduler.spawn(coro("low"), priority=0)
+    high = await scheduler.spawn(coro("high"), priority=1)
+
+    # Reprioritize the queued job in-place, without closing/respawning.
+    low.set_priority(10)
+    assert low.priority == 10
+
+    blocker.set()
+    await scheduler.wait_and_close()
+
+    assert started == ["low", "high"]
+    assert high.closed
+
+
+async def test_set_priority_not_pending_raises(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1)
+
+    async def coro() -> None:
+        await asyncio.sleep(0)
+
+    active_job = await scheduler.spawn(coro())
+    assert active_job.active
+    with pytest.raises(RuntimeError, match="not pending"):
+        active_job.set_priority(5)
+
+    await active_job.wait()
+    assert active_job.closed
+    with pytest.raises(RuntimeError, match="not pending"):
+        active_job.set_priority(5)
+
+
+async def test_aging_interval_validation(make_scheduler: _MakeScheduler) -> None:
+    with pytest.raises(ValueError, match="aging_interval"):
+        await make_scheduler(aging_interval=0)
+    with pytest.raises(ValueError, match="aging_interval"):
+        await make_scheduler(aging_interval=-1)
+
+
+async def test_aging_prevents_starvation(make_scheduler: _MakeScheduler) -> None:
+    # Timeline: a single-slot scheduler is saturated by a continuous
+    # stream of high-priority jobs; an old low-priority job queued at
+    # the beginning must eventually age enough to win a slot.
+    limit = 1
+    scheduler = await make_scheduler(limit=limit, aging_interval=0.02)
+    started: List[str] = []
+    max_active = 0
+
+    async def coro(tag: str) -> None:
+        nonlocal max_active
+        max_active = max(max_active, scheduler.active_count)
+        started.append(tag)
+        await asyncio.sleep(0.01)
+
+    # t=0: the single slot is occupied...
+    await scheduler.spawn(coro("first"))
+    await asyncio.sleep(0)
+    assert scheduler.active_count == 1
+
+    # ...and a low-priority job is queued behind it.
+    old_low = await scheduler.spawn(coro("old_low"), priority=0)
+    assert old_low.pending
+
+    # Continuously inject high-priority jobs; without aging "old_low"
+    # would starve forever.
+    high_tags = []
+    for i in range(500):
+        tag = f"high{i}"
+        high_tags.append(tag)
+        await scheduler.spawn(coro(tag), priority=10)
+        assert scheduler.active_count <= limit
+        await asyncio.sleep(0.005)
+        if "old_low" in started:
+            break
+
+    await scheduler.wait_and_close()
+
+    # The aged low-priority job eventually got a slot...
+    assert "old_low" in started
+    # ...some high-priority jobs did jump ahead of it first...
+    assert started.index("old_low") > started.index("high0")
+    # ...but it overtook the later-arriving high-priority jobs.
+    assert started.index("old_low") < started.index(high_tags[-1])
+    # The concurrency limit was never exceeded.
+    assert max_active <= limit
+    assert scheduler.active_count == 0

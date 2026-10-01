@@ -16,6 +16,7 @@ Scheduler
                      wait_timeout: float | None = 60.0, \
                      limit: int = 100, \
                      pending_limit: int = 10000, \
+                     aging_interval: float | None = None, \
                      exception_handler: ExceptionHandler | None = None)
 
    A container for managed jobs.
@@ -41,6 +42,14 @@ Scheduler
 
    * *pending_limit* is a limit for amount of jobs awaiting starting,
      ``10000`` by default. Use ``0`` for infinite pending queue size.
+
+   * *aging_interval* is an optional aging rule for the pending queue,
+     disabled (``None``) by default.  When set to a positive number of
+     seconds, every pending job gains ``+1`` *effective priority* for
+     every *aging_interval* seconds it has spent in the pending queue,
+     which prevents low-priority jobs from starving under a continuous
+     stream of high-priority ones.  See :meth:`spawn` for the exact
+     priority semantics.
 
    * *exception_handler* is a callable with
      ``handler(scheduler, context)`` signature to log
@@ -93,7 +102,7 @@ Scheduler
 
       ``True`` if scheduler is closed (:meth:`close` called).
 
-   .. py:method:: spawn[T](coro: Coroutine[Any, Any, T], name: str | None = None) -> Job
+   .. py:method:: spawn[T](coro: Coroutine[Any, Any, T], name: str | None = None, *, priority: int = 0) -> Job
       :async:
 
       Spawn a new job for execution *coro* coroutine.
@@ -102,6 +111,38 @@ Scheduler
 
       The job might be started immediately or pushed into pending list
       if concurrency :attr:`limit` exceeded.
+
+      *priority* is an integer (higher means more urgent, ``0`` by
+      default) used to order jobs that are **waiting** for a free
+      execution slot.  Priority never preempts an already running job;
+      it only affects which *pending* job is picked next when a slot
+      is freed.
+
+      The *effective priority* of a pending job is its base *priority*
+      plus an aging bonus: the waiting time is counted from the moment
+      the job actually enters the pending queue (i.e. after
+      :meth:`spawn` has found no free execution slot and, if the pending
+      queue was full, after the wait for a free pending slot has
+      finished), and the job gains ``+1`` effective priority for every
+      *aging_interval* seconds waited.  Aging is disabled unless
+      *aging_interval* was passed to the scheduler constructor.
+
+      Pending jobs with equal effective priority are started in their
+      original submission order, so the default configuration (all
+      priorities equal, no aging) behaves as a plain FIFO queue.
+
+      The priority of a job already sitting in the pending queue can be
+      adjusted in-place with :meth:`Job.set_priority`; closing and
+      re-submitting the job is not required (and would discard its
+      accumulated waiting time).
+
+      :attr:`pending_limit` applies to the number of waiting entries
+      regardless of their priority: a high *priority* does not bypass
+      a full pending queue, :meth:`spawn` still suspends until a
+      pending slot is freed.  A job cancelled while waiting leaves its
+      entry in the queue; such entries are skipped and discarded
+      lazily when the scheduler looks for the next job to start (they
+      keep occupying a pending slot until then).
 
       If :attr:`pending_count` is greater than :attr:`pending_limit`
       and the limit is *finite* (not ``0``) the method suspends
@@ -112,6 +153,11 @@ Scheduler
       .. versionchanged:: 0.2
 
          The method respects :attr:`pending_limit` now.
+
+      .. versionchanged:: 1.5
+
+         Added the *priority* keyword-only parameter and the optional
+         *aging_interval* scheduler setting.
 
    .. py:method:: shield[T](coro: Future[T] | Awaitable[T]) -> Future
       :async:
@@ -197,6 +243,23 @@ Job
    .. attribute:: closed: bool
 
       Job is finished.
+
+   .. attribute:: priority: int
+
+      The current base priority of the job (``0`` by default).
+
+      .. versionadded:: 1.5
+
+   .. py:method:: set_priority(priority: int) -> None
+
+      Change the priority of a *pending* job in-place.
+
+      The new value takes effect the next time the scheduler picks a
+      job from the pending queue; already running jobs are never
+      preempted.  Raises :exc:`RuntimeError` if the job has already
+      started or is closed.
+
+      .. versionadded:: 1.5
 
    .. py:method:: wait(*, timeout: float | None = None) -> T
       :async:

@@ -22,6 +22,7 @@ class Job(Generic[_T]):
         "_coro",
         "_scheduler",
         "_name",
+        "_priority",
         "_started",
         "_closed",
         "_explicit",
@@ -34,10 +35,13 @@ class Job(Generic[_T]):
         coro: Coroutine[object, object, _T],
         scheduler: Scheduler,
         name: Optional[str] = None,
+        *,
+        priority: int = 0,
     ):
         self._coro = coro
         self._scheduler: Optional[Scheduler] = scheduler
         self._name = name
+        self._priority = priority
         loop = asyncio.get_running_loop()
         self._started = loop.create_future()
 
@@ -70,6 +74,25 @@ class Job(Generic[_T]):
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def priority(self) -> int:
+        """The current base priority of the job."""
+        return self._priority
+
+    def set_priority(self, priority: int) -> None:
+        """Change the priority of a *pending* job in-place.
+
+        The new value takes effect the next time the scheduler picks a
+        job from the pending queue; already running jobs are never
+        preempted.  Raises :exc:`RuntimeError` if the job has already
+        started or is closed.
+        """
+        if not self.pending:
+            raise RuntimeError(
+                "Cannot change priority of a job that is not pending"
+            )
+        self._priority = priority
 
     def get_name(self) -> Optional[str]:
         """Get the task name.
