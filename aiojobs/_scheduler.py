@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from collections import deque
 from collections.abc import Awaitable, Collection, Coroutine, Iterator
 from contextlib import suppress
 from types import TracebackType
@@ -41,6 +42,9 @@ class Scheduler(Collection[Job[object]]):
         "_failed_tasks",
         "_failed_task",
         "_pending",
+        "_pending_waiters",
+        "_pending_limit",
+        "_active",
         "_closed",
     )
 
@@ -57,8 +61,10 @@ class Scheduler(Collection[Job[object]]):
             raise TypeError(
                 f"A callable object or None is expected, got {exception_handler!r}"
             )
-
+        if pending_limit < 0:
+            raise ValueError("maxsize is not a non-negative integer")
         self._jobs: Set[Job[object]] = set()
+        self._active: Set[Job[object]] = set()
         self._shields: Set[asyncio.Task[object]] = set()
         self._close_timeout = close_timeout
         self._wait_timeout = wait_timeout
@@ -70,7 +76,11 @@ class Scheduler(Collection[Job[object]]):
         self._failed_task: Optional[asyncio.Task[None]] = None
         if sys.version_info < (3, 10):
             self._failed_task = asyncio.create_task(self._wait_failed())
-        self._pending: asyncio.Queue[Job[object]] = asyncio.Queue(maxsize=pending_limit)
+        self._pending: deque[Job[object]] = deque()
+        self._pending_waiters: deque[
+            tuple[asyncio.Future[None], "asyncio.Task[object]"]
+        ] = deque()
+        self._pending_limit = pending_limit
         self._closed = False
 
     def __iter__(self) -> Iterator[Job[Any]]:
@@ -108,7 +118,7 @@ class Scheduler(Collection[Job[object]]):
 
     @property
     def pending_limit(self) -> int:
-        return self._pending.maxsize
+        return self._pending_limit
 
     @property
     def close_timeout(self) -> Optional[float]:
@@ -116,11 +126,11 @@ class Scheduler(Collection[Job[object]]):
 
     @property
     def active_count(self) -> int:
-        return len(self._jobs) - self._pending.qsize()
+        return len(self._active)
 
     @property
     def pending_count(self) -> int:
-        return self._pending.qsize()
+        return len(self._pending)
 
     @property
     def closed(self) -> bool:
@@ -140,14 +150,18 @@ class Scheduler(Collection[Job[object]]):
         should_start = self._limit is None or self.active_count < self._limit
         if should_start:
             job._start()
-        else:
-            try:
-                # wait for free slot in queue
-                await self._pending.put(job)
-            except asyncio.CancelledError:
-                await job.close()
-                raise
+            self._jobs.add(job)
+            self._active.add(job)
+            return job
+
+        try:
+            await self._wait_for_pending_slot()
+        except BaseException:
+            self._reject_job(job)
+            raise
+
         self._jobs.add(job)
+        self._pending.append(job)
         return job
 
     def shield(self, arg: _FutureLike[_T]) -> "asyncio.Future[_T]":
@@ -204,14 +218,11 @@ class Scheduler(Collection[Job[object]]):
         if self._closed:
             return
         self._closed = True  # prevent adding new jobs
+        waiting_spawns = [spawn_task for _, spawn_task in self._pending_waiters]
+        self._wake_pending_waiters()
 
         jobs = self._jobs
         if jobs or self._shields:
-            # cleanup pending queue
-            # all job will be started on closing
-            while not self._pending.empty():
-                self._pending.get_nowait()
-
             for f in self._shields:
                 f.cancel()
 
@@ -220,7 +231,13 @@ class Scheduler(Collection[Job[object]]):
                 *(asyncio.wait_for(f, self._close_timeout) for f in self._shields),
                 return_exceptions=True,
             )
-            self._jobs.clear()
+
+        if waiting_spawns:
+            await asyncio.gather(*waiting_spawns, return_exceptions=True)
+
+        self._jobs.clear()
+        self._active.clear()
+        self._pending.clear()
         if self._failed_task is not None:
             self._failed_tasks.put_nowait(None)
             await self._failed_task
@@ -236,21 +253,62 @@ class Scheduler(Collection[Job[object]]):
         return self._exception_handler
 
     def _done(self, job: Job[object]) -> None:
+        self._active.discard(job)
         self._jobs.discard(job)
-        if not self.pending_count:
-            return
-        # No pending jobs when limit is None
-        # Safe to subtract.
-        ntodo = self._limit - self.active_count  # type: ignore[operator]
-        i = 0
-        while i < ntodo:
-            if not self.pending_count:
-                return
-            new_job = self._pending.get_nowait()
+        while self._pending and (
+            self._limit is None or len(self._active) < self._limit
+        ):
+            new_job = self._pending.popleft()
             if new_job.closed:
+                new_job._cancel_before_start()
+                self._jobs.discard(new_job)
+                new_job._scheduler = None
                 continue
+            self._active.add(new_job)
             new_job._start()
-            i += 1
+        self._wake_pending_waiters()
+
+    async def _wait_for_pending_slot(self) -> None:
+        loop = asyncio.get_running_loop()
+        while (
+            not self._closed
+            and self._pending_limit > 0
+            and self.pending_count >= self._pending_limit
+        ):
+            waiter = loop.create_future()
+            current = asyncio.current_task()
+            assert current is not None
+            self._pending_waiters.append((waiter, current))
+            try:
+                await waiter
+            finally:
+                try:
+                    self._pending_waiters.remove((waiter, current))
+                except ValueError:
+                    pass
+
+        if self._closed:
+            raise RuntimeError("Scheduling a new job after closing")
+
+    def _wake_pending_waiters(self) -> None:
+        while self._pending_waiters:
+            waiter, _ = self._pending_waiters.popleft()
+            if not waiter.done():
+                waiter.set_result(None)
+
+    def _reject_job(self, job: Job[object]) -> None:
+        job._cancel_before_start()
+        job._scheduler = None
+
+    async def _cancel_pending(self, job: Job[object]) -> None:
+        try:
+            self._pending.remove(job)
+        except ValueError:
+            return
+        job._cancel_before_start()
+        self._jobs.discard(job)
+        job._scheduler = None
+        self._wake_pending_waiters()
 
     async def _wait_failed(self) -> None:
         # a coroutine for waiting failed tasks

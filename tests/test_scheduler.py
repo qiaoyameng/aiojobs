@@ -1,7 +1,9 @@
 import asyncio
 import sys
 from collections.abc import Awaitable
-from typing import Callable, List, NoReturn
+from contextvars import ContextVar
+from inspect import getcoroutinestate
+from typing import Callable, Dict, List, NoReturn
 from unittest import mock
 
 import pytest
@@ -432,6 +434,215 @@ async def test_scheduler_concurrency_limit(make_scheduler: _MakeScheduler) -> No
     assert scheduler.pending_count == 0
     assert job1.closed
     assert job2.closed
+
+
+async def test_spawn_snapshots_context_for_queued_job(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    request_id: ContextVar[str] = ContextVar("request_id")
+    scheduler = await make_scheduler(limit=1, pending_limit=2)
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    seen: List[str] = []
+
+    async def first_job() -> None:
+        first_entered.set()
+        await release_first.wait()
+        seen.append(request_id.get())
+
+    async def queued_job() -> None:
+        seen.append(request_id.get())
+
+    request_id.set("first-request")
+    first = await scheduler.spawn(first_job())
+    await first_entered.wait()
+
+    request_id.set("second-request")
+    second = await scheduler.spawn(queued_job())
+    assert scheduler.pending_count == 1
+
+    request_id.set("changed-request")
+    release_first.set()
+
+    await first.wait()
+    await second.wait()
+    assert seen == ["first-request", "second-request"]
+
+
+async def test_nested_spawn_uses_submitting_job_context(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    request_id: ContextVar[str] = ContextVar("request_id")
+    scheduler = await make_scheduler(limit=1, pending_limit=2)
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    nested_entered = asyncio.Event()
+    seen: List[str] = []
+
+    async def first_job() -> None:
+        first_entered.set()
+        await release_first.wait()
+
+    async def nested_job() -> None:
+        seen.append(request_id.get())
+        nested_entered.set()
+
+    async def parent_job() -> None:
+        request_id.set("nested-request")
+        await scheduler.spawn(nested_job())
+        request_id.set("changed-parent-request")
+
+    request_id.set("outer-request")
+    first = await scheduler.spawn(first_job())
+    await first_entered.wait()
+
+    await scheduler.spawn(parent_job())
+    release_first.set()
+
+    await nested_entered.wait()
+    await first.wait()
+    assert seen == ["nested-request"]
+
+
+async def test_queued_exception_handler_receives_failed_job(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    exc_handler = mock.Mock()
+    scheduler = await make_scheduler(limit=1, exception_handler=exc_handler)
+    blocker_ready = asyncio.Event()
+    release_blocker = asyncio.Event()
+    failure_reported = asyncio.Event()
+    exc = RuntimeError("queued failure")
+
+    def handle_failure(
+        actual_scheduler: Scheduler, context: Dict[str, object]
+    ) -> None:
+        if context["job"] is second:
+            failure_reported.set()
+
+    exc_handler.side_effect = handle_failure
+
+    async def blocker() -> None:
+        blocker_ready.set()
+        await release_blocker.wait()
+
+    async def failing_job() -> NoReturn:
+        raise exc
+
+    first = await scheduler.spawn(blocker())
+    await blocker_ready.wait()
+    second = await scheduler.spawn(failing_job())
+
+    release_blocker.set()
+    await first.wait()
+    await failure_reported.wait()
+    assert second.closed
+    exc_handler.assert_called_once_with(
+        scheduler,
+        {
+            "exception": exc,
+            "job": second,
+            "message": "Job processing failed",
+        },
+    )
+
+
+async def test_spawn_cancelled_at_pending_capacity_closes_coroutine(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1, pending_limit=1)
+    blocker_ready = asyncio.Event()
+    release_blocker = asyncio.Event()
+
+    async def blocker() -> None:
+        blocker_ready.set()
+        await release_blocker.wait()
+
+    async def unused_job() -> None:
+        pass
+
+    await scheduler.spawn(blocker())
+    await blocker_ready.wait()
+
+    queued = unused_job()
+    await scheduler.spawn(queued)
+
+    rejected = unused_job()
+    spawning = asyncio.create_task(scheduler.spawn(rejected))
+    await asyncio.sleep(0)
+
+    spawning.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await spawning
+
+    assert scheduler.active_count == 1
+    assert scheduler.pending_count == 1
+    assert getcoroutinestate(rejected) == "CORO_CLOSED"
+
+    release_blocker.set()
+
+
+async def test_pending_job_close_releases_coroutine_and_context(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1, pending_limit=1)
+    blocker_ready = asyncio.Event()
+    release_blocker = asyncio.Event()
+
+    async def blocker() -> None:
+        blocker_ready.set()
+        await release_blocker.wait()
+
+    async def unused_job() -> None:
+        pass
+
+    await scheduler.spawn(blocker())
+    await blocker_ready.wait()
+
+    queued_coro = unused_job()
+    job = await scheduler.spawn(queued_coro)
+    await job.close()
+
+    assert getcoroutinestate(queued_coro) == "CORO_CLOSED"
+    assert job._context is None
+    assert scheduler.pending_count == 0
+
+    release_blocker.set()
+
+
+async def test_close_wakes_pending_capacity_wait(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1, pending_limit=1)
+    blocker_ready = asyncio.Event()
+
+    async def blocker() -> None:
+        blocker_ready.set()
+        await asyncio.Event().wait()
+
+    async def unused_job() -> None:
+        pass
+
+    active = await scheduler.spawn(blocker())
+    await blocker_ready.wait()
+
+    queued_coro = unused_job()
+    queued = await scheduler.spawn(queued_coro)
+
+    rejected = unused_job()
+    spawning = asyncio.create_task(scheduler.spawn(rejected))
+    await asyncio.sleep(0)
+
+    closing = asyncio.create_task(scheduler.close())
+    with pytest.raises(RuntimeError, match="Scheduling a new job after closing"):
+        await spawning
+    await closing
+
+    assert getcoroutinestate(rejected) == "CORO_CLOSED"
+    assert getcoroutinestate(queued_coro) == "CORO_CLOSED"
+    assert active._context is None
+    assert queued._context is None
+    assert scheduler.pending_count == 0
 
 
 async def test_resume_closed_task(make_scheduler: _MakeScheduler) -> None:

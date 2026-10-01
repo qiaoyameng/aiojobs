@@ -2,6 +2,7 @@ import asyncio
 import sys
 import traceback
 from collections.abc import Coroutine
+from contextvars import Context, copy_context
 from typing import TYPE_CHECKING, Generic, Optional, TypeVar
 
 if sys.version_info >= (3, 11):
@@ -26,6 +27,7 @@ class Job(Generic[_T]):
         "_closed",
         "_explicit",
         "_task",
+        "_context",
         "_source_traceback",
     )
 
@@ -44,6 +46,7 @@ class Job(Generic[_T]):
         self._closed = False
         self._explicit = False
         self._task: Optional[asyncio.Task[_T]] = None
+        self._context: Optional[Context] = copy_context()
 
         tb = traceback.extract_stack(sys._getframe(2)) if loop.get_debug() else None
         self._source_traceback = tb
@@ -105,6 +108,8 @@ class Job(Generic[_T]):
 
     async def wait(self, *, timeout: Optional[float] = None) -> _T:
         if self._closed:
+            if self._task is None:
+                raise asyncio.CancelledError
             assert self._task is not None  # Task must have been created if closed.
             return await self._task
         self._explicit = True
@@ -122,11 +127,9 @@ class Job(Generic[_T]):
     async def _close(self, timeout: Optional[float]) -> None:
         self._closed = True
         if self._task is None:
-            # the task is closed immediately without actual execution
-            # it prevents a warning like
-            # RuntimeWarning: coroutine 'coro' was never awaited
-            self._start()
-            assert self._task is not None
+            assert self._scheduler is not None
+            await self._scheduler._cancel_pending(self)
+            return
         self._task.cancel()
         # self._scheduler is None after _done_callback()
         scheduler = self._scheduler
@@ -174,9 +177,20 @@ class Job(Generic[_T]):
 
     def _start(self) -> None:
         assert self._task is None
-        self._task = asyncio.create_task(self._coro, name=self._name)
+        assert self._context is not None
+        self._task = self._context.run(
+            asyncio.create_task, self._coro, name=self._name
+        )
         self._task.add_done_callback(self._done_callback)
         self._started.set_result(None)
+
+    def _cancel_before_start(self) -> None:
+        assert self._task is None
+        self._closed = True
+        self._coro.close()
+        self._context = None
+        if not self._started.done():
+            self._started.cancel()
 
     def _done_callback(self, task: "asyncio.Task[_T]") -> None:
         assert self._scheduler is not None
@@ -190,6 +204,7 @@ class Job(Generic[_T]):
             if exc is not None and not self._explicit:
                 self._report_exception(exc)
                 scheduler._failed_tasks.put_nowait(task)
+        self._context = None
         self._scheduler = None  # drop backref
         self._closed = True
 
