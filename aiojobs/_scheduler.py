@@ -14,6 +14,7 @@ from typing import (
     Union,
 )
 
+from ._group import Group
 from ._job import Job
 
 if sys.version_info >= (3, 11):
@@ -185,6 +186,17 @@ class Scheduler(Collection[Job[object]]):
         inner.add_done_callback(_inner_done_callback)
         outer.add_done_callback(_outer_done_callback)
         return outer
+
+    def create_group(self) -> Group:
+        """Create a job group bound to this scheduler.
+
+        Jobs spawned into the group share the scheduler's concurrency
+        and pending limits.  The first regular exception raised by a
+        member of the group cancels the other running members and
+        discards the pending ones; ``Group.wait()`` reports every
+        failed job.
+        """
+        return Group(self)
 
     async def wait_and_close(self, timeout: Optional[float] = None) -> None:
         if timeout is None:

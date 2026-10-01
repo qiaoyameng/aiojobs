@@ -8,6 +8,7 @@ asyncio applications.
 import warnings
 from typing import Optional
 
+from ._group import Group, GroupError
 from ._job import Job
 from ._scheduler import ExceptionHandler, Scheduler
 
@@ -35,4 +36,4 @@ async def create_scheduler(
     )
 
 
-__all__ = ("Job", "Scheduler", "create_scheduler")
+__all__ = ("Group", "GroupError", "Job", "Scheduler", "create_scheduler")

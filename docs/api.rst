@@ -123,6 +123,13 @@ Scheduler
       used to ensure that shielded tasks will actually be completed on
       application shutdown.
 
+   .. py:method:: create_group() -> Group
+
+      Create a new job :class:`Group` bound to this scheduler.
+
+      Jobs spawned into the group share the scheduler's concurrency
+      and pending limits.
+
    .. py:method:: wait_and_close(timeout: float | None = None) -> None
       :async:
 
@@ -166,6 +173,71 @@ Scheduler
       * *source_traceback*: a traceback at the moment of job creation
         (present only for debug event loops, see also
         :envvar:`PYTHONASYNCIODEBUG`).
+
+
+Group
+-----
+
+.. class:: Group
+
+   A group of jobs spawned through the same :class:`Scheduler`,
+   created by :meth:`Scheduler.create_group`.
+
+   The group inherits the concurrency and pending limits of its
+   scheduler.  The first regular exception raised by a member cancels
+   the other running members and discards the ones that have not
+   started yet.  Groups from the same scheduler are independent: a
+   failure in one group does not affect the jobs of another group.
+
+   The class implements :class:`collections.abc.Collection` contract
+   over its jobs and can be used as an async context manager.  A
+   normal exit waits for all members; leaving the block with an
+   exception cancels all unfinished members without masking the
+   original exception.  No new jobs are accepted after the group is
+   closed.
+
+   .. attribute:: closed: bool
+
+      ``True`` if the group is closed.
+
+   .. attribute:: scheduler: Scheduler
+
+      The scheduler the group is bound to.
+
+   .. py:method:: spawn[T](coro: Coroutine[Any, Any, T], name: str | None = None) -> Job
+      :async:
+
+      Spawn a new job for execution of *coro* through the group's
+      scheduler.
+
+      Return a new :class:`Job` object.
+
+      Raise :exc:`RuntimeError` if the group is closed.
+
+   .. py:method:: wait() -> None
+      :async:
+
+      Wait for all members of the group.
+
+      Raise :exc:`GroupError` if at least one member has failed;
+      errors raised by other members while the group is being
+      cancelled do not mask the first failure.
+
+   .. py:method:: close() -> None
+      :async:
+
+      Close the group, cancelling all unfinished members and
+      discarding the ones that have not started yet.
+
+.. class:: GroupError
+
+   Raised by :meth:`Group.wait` when one or more jobs of the group
+   have failed.
+
+   .. attribute:: failures: dict[Job, BaseException]
+
+      A mapping of every failed job to the exception it has finished
+      with.
 
 
 Job
