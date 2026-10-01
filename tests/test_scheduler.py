@@ -1,7 +1,8 @@
 import asyncio
 import sys
 from collections.abc import Awaitable
-from typing import Callable, List, NoReturn
+from contextvars import ContextVar
+from typing import Callable, List, NoReturn, Optional
 from unittest import mock
 
 import pytest
@@ -356,6 +357,255 @@ async def test_pending_queue_limit_wait(make_scheduler: _MakeScheduler) -> None:
 
     assert scheduler.active_count == 1
     assert scheduler.pending_count == 1
+
+
+async def test_spawn_context_is_copied_at_submission(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    request_id: ContextVar[str] = ContextVar("request_id")
+    scheduler = await make_scheduler(limit=1)
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    first_result: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    second_result: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+    async def first_worker() -> None:
+        first_started.set()
+        await release_first.wait()
+        first_result.set_result(request_id.get())
+
+    async def second_worker() -> None:
+        second_result.set_result(request_id.get())
+
+    async def submit(
+        value: str, worker: Callable[[], Awaitable[None]]
+    ) -> Job[None]:
+        request_id.set(value)
+        return await scheduler.spawn(worker())
+
+    await submit("one", first_worker)
+    await first_started.wait()
+
+    second = await submit("two", second_worker)
+    assert second.pending
+    request_id.set("changed after second submission")
+
+    release_first.set()
+    await second.wait()
+
+    assert second_result.result() == "two"
+    assert first_result.result() == "one"
+
+
+async def test_immediate_spawn_context_is_frozen(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    request_id: ContextVar[str] = ContextVar("request_id")
+    scheduler = await make_scheduler()
+    result: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    release = asyncio.Event()
+
+    async def worker() -> None:
+        await release.wait()
+        result.set_result(request_id.get())
+
+    request_id.set("one")
+    job = await scheduler.spawn(worker())
+    request_id.set("changed after submission")
+    release.set()
+    await job.wait()
+
+    assert result.result() == "one"
+
+
+async def test_nested_spawn_uses_submitting_job_context(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    request_id: ContextVar[str] = ContextVar("request_id")
+    scheduler = await make_scheduler(limit=2, pending_limit=1)
+
+    blocker_started = asyncio.Event()
+    release_blocker = asyncio.Event()
+    inner_started = asyncio.Event()
+    inner_result: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+    async def blocker() -> None:
+        blocker_started.set()
+        await release_blocker.wait()
+
+    async def inner() -> None:
+        inner_result.set_result(request_id.get())
+        inner_started.set()
+
+    async def parent() -> None:
+        request_id.set("parent")
+        inner_job = await scheduler.spawn(inner())
+        request_id.set("changed after inner submission")
+        await inner_started.wait()
+        await inner_job.wait()
+
+    await scheduler.spawn(blocker())
+    await blocker_started.wait()
+
+    parent_job = await scheduler.spawn(parent())
+    request_id.set("main")
+    release_blocker.set()
+    await parent_job.wait()
+    await scheduler.close()
+
+    assert inner_result.result() == "parent"
+
+
+async def test_cancelled_waiting_spawn_rejects_its_job(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    request_id: ContextVar[str] = ContextVar("request_id")
+    scheduler = await make_scheduler(limit=1, pending_limit=1)
+
+    release_first = asyncio.Event()
+    first_started = asyncio.Event()
+    registered = asyncio.Event()
+    rejected_job: Optional[Job[None]] = None
+
+    class PendingPutters(type(scheduler._pending_putters)):
+        def append(self, item: tuple[asyncio.Future[None], Job[None]]) -> None:
+            nonlocal rejected_job
+            rejected_job = item[1]
+            super().append(item)
+            registered.set()
+
+    scheduler._pending_putters = PendingPutters()
+
+    async def first() -> None:
+        first_started.set()
+        await release_first.wait()
+
+    async def queued() -> None:
+        pass
+
+    async def waiting_submit(value: str) -> None:
+        request_id.set(value)
+        await scheduler.spawn(queued())
+
+    await scheduler.spawn(first())
+    await first_started.wait()
+    await scheduler.spawn(queued())
+
+    waiting_task = asyncio.ensure_future(waiting_submit("waiting"))
+    await registered.wait()
+    waiting_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting_task
+
+    assert scheduler.active_count == 1
+    assert scheduler.pending_count == 1
+    release_first.set()
+    await scheduler.close()
+    assert not scheduler._pending_putters
+    assert rejected_job is not None
+    assert rejected_job.closed
+    assert rejected_job._coro is None
+    assert rejected_job._context is None
+
+
+async def test_closing_scheduler_rejects_waiting_spawns(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    scheduler = await make_scheduler(limit=1, pending_limit=1)
+
+    first_started = asyncio.Event()
+    registered = asyncio.Event()
+
+    class PendingPutters(type(scheduler._pending_putters)):
+        def append(self, item: object) -> None:
+            super().append(item)
+            registered.set()
+
+    scheduler._pending_putters = PendingPutters()
+
+    async def first() -> None:
+        first_started.set()
+        await asyncio.Event().wait()
+
+    async def queued() -> None:
+        pass
+
+    async def waiting_submit() -> None:
+        await scheduler.spawn(queued())
+
+    await scheduler.spawn(first())
+    await first_started.wait()
+    await scheduler.spawn(queued())
+    waiting_task = asyncio.ensure_future(waiting_submit())
+    await registered.wait()
+
+    closer = asyncio.ensure_future(scheduler.close())
+    with pytest.raises(RuntimeError, match="Scheduler is closing"):
+        await waiting_task
+    await closer
+
+
+async def test_closing_pending_job_releases_context(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    request_id: ContextVar[str] = ContextVar("request_id")
+    scheduler = await make_scheduler(limit=1)
+    first_started = asyncio.Event()
+
+    async def first() -> None:
+        first_started.set()
+        await asyncio.Event().wait()
+
+    async def pending() -> None:
+        pytest.fail("pending job was started")
+
+    request_id.set("one")
+    await scheduler.spawn(first())
+    await first_started.wait()
+
+    request_id.set("two")
+    job = await scheduler.spawn(pending())
+    await job.close()
+
+    assert job._coro is None
+    assert job._context is None
+    await scheduler.close()
+
+
+async def test_exception_handler_identifies_failed_job(
+    make_scheduler: _MakeScheduler,
+) -> None:
+    exc_handler = mock.Mock()
+    scheduler = await make_scheduler(
+        limit=1,
+        close_timeout=1,
+        exception_handler=exc_handler,
+    )
+    first_failed = asyncio.Event()
+    second_started = asyncio.Event()
+    exc1 = RuntimeError("one")
+    exc2 = RuntimeError("two")
+
+    async def fail_first() -> NoReturn:
+        first_failed.set()
+        raise exc1
+
+    async def fail_second() -> NoReturn:
+        second_started.set()
+        raise exc2
+
+    job1 = await scheduler.spawn(fail_first())
+    job2 = await scheduler.spawn(fail_second())
+
+    await first_failed.wait()
+    await second_started.wait()
+    await scheduler.close()
+
+    jobs = [call.args[1]["job"] for call in exc_handler.call_args_list]
+    exceptions = [call.args[1]["exception"] for call in exc_handler.call_args_list]
+    assert jobs == [job1, job2]
+    assert exceptions == [exc1, exc2]
 
 
 async def test_scheduler_concurrency_pending_limit(

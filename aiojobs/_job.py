@@ -2,7 +2,8 @@ import asyncio
 import sys
 import traceback
 from collections.abc import Coroutine
-from typing import TYPE_CHECKING, Generic, Optional, TypeVar
+from contextvars import Context, copy_context
+from typing import TYPE_CHECKING, Generic, NoReturn, Optional, TypeVar
 
 if sys.version_info >= (3, 11):
     from asyncio import timeout as asyncio_timeout
@@ -27,6 +28,7 @@ class Job(Generic[_T]):
         "_explicit",
         "_task",
         "_source_traceback",
+        "_context",
     )
 
     def __init__(
@@ -35,7 +37,7 @@ class Job(Generic[_T]):
         scheduler: Scheduler,
         name: Optional[str] = None,
     ):
-        self._coro = coro
+        self._coro: Optional[Coroutine[object, object, _T]] = coro
         self._scheduler: Optional[Scheduler] = scheduler
         self._name = name
         loop = asyncio.get_running_loop()
@@ -44,6 +46,7 @@ class Job(Generic[_T]):
         self._closed = False
         self._explicit = False
         self._task: Optional[asyncio.Task[_T]] = None
+        self._context: Optional[Context] = copy_context()
 
         tb = traceback.extract_stack(sys._getframe(2)) if loop.get_debug() else None
         self._source_traceback = tb
@@ -57,7 +60,8 @@ class Job(Generic[_T]):
         state = " ".join(info)
         if state:
             state += " "
-        return f"<Job {state}coro=<{self._coro}>>"
+        coro = "coro=<done>" if self._coro is None else f"coro=<{self._coro}>"
+        return f"<Job {state}{coro}>"
 
     @property
     def active(self) -> bool:
@@ -120,12 +124,28 @@ class Job(Generic[_T]):
         await self._close(timeout)
 
     async def _close(self, timeout: Optional[float]) -> None:
+        if self._closed:
+            return
         self._closed = True
         if self._task is None:
-            # the task is closed immediately without actual execution
-            # it prevents a warning like
-            # RuntimeWarning: coroutine 'coro' was never awaited
-            self._start()
+            if self._scheduler is not None:
+                self._scheduler._discard_pending(self)
+            coro = self._coro
+            assert coro is not None
+            coro.close()
+            self._coro = None
+            self._context = None
+            if self._scheduler is not None:
+                self._scheduler._admit_pending_putters()
+
+            async def cancelled() -> NoReturn:
+                raise asyncio.CancelledError
+
+            self._task = Context().run(
+                asyncio.create_task, cancelled(), name=self._name
+            )
+            self._task.add_done_callback(self._done_callback)
+            self._started.set_result(None)
             assert self._task is not None
         self._task.cancel()
         # self._scheduler is None after _done_callback()
@@ -174,9 +194,26 @@ class Job(Generic[_T]):
 
     def _start(self) -> None:
         assert self._task is None
-        self._task = asyncio.create_task(self._coro, name=self._name)
+        assert self._coro is not None
+        assert self._context is not None
+        coro = self._coro
+        context = self._context
+        self._coro = None
+        self._context = None
+        self._task = context.run(asyncio.create_task, coro, name=self._name)
         self._task.add_done_callback(self._done_callback)
         self._started.set_result(None)
+
+    def _reject(self) -> None:
+        if self._closed:
+            return
+        assert self._task is None
+        assert self._coro is not None
+        self._closed = True
+        self._coro.close()
+        self._coro = None
+        self._context = None
+        self._scheduler = None
 
     def _done_callback(self, task: "asyncio.Task[_T]") -> None:
         assert self._scheduler is not None
@@ -192,6 +229,7 @@ class Job(Generic[_T]):
                 scheduler._failed_tasks.put_nowait(task)
         self._scheduler = None  # drop backref
         self._closed = True
+        self._coro = None
 
     def _report_exception(self, exc: BaseException) -> None:
         assert self._scheduler is not None
